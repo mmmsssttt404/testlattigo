@@ -1,13 +1,13 @@
 // hevm_stub.go (Lattigo v6.1.1)
+//
 // HEVM runtime with:
-// - SEAL-like semantics (notably: scale metadata alignment on ADDCC/ADDCP)
+// - ONE boot-capable parameter set: N16QP1546H192H32 (CKKS + BOOT use the same preset)
 // - client/server context split (create_context -> loadClient -> loadProgram)
 // - cgo-safe handles (runtime/cgo.Handle) for VM, Context, Ciphertext exchange
-// - LAZY rotation keys (only generate the specific rotation key when OP_ROTATEC is executed)
+// - LAZY rotation keys for OP_ROTATEC (server holds SK in this test design)
+// - Bootstrapping integrated (OP_BOOT) via bootstrapping.NewEvaluator + Evaluator.Bootstrap
 //
-// NOTE (test-only design): server VM also loads the secret key from context so it can
-// lazily generate rotation keys. This is NOT a secure deployment model, but it matches
-// your current testing goal: avoid generating many rotation keys upfront.
+// NOTE: test-only: server loads SK so it can lazily generate rotation keys + boot keys.
 
 package main
 
@@ -57,14 +57,16 @@ import (
 	"sync"
 	"unsafe"
 
+	"github.com/tuneinsight/lattigo/v6/circuits/ckks/bootstrapping"
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
+	"github.com/tuneinsight/lattigo/v6/ring"
 	"github.com/tuneinsight/lattigo/v6/schemes/ckks"
 )
 
 const (
 	kMagicHEVM = uint32(0x4845564D)
 
-	// opcodes (match your SEAL runtime)
+	// opcodes
 	OP_ENCODE   = 0
 	OP_ROTATEC  = 1
 	OP_NEGATEC  = 2
@@ -77,18 +79,44 @@ const (
 	OP_MULCP    = 9
 	OP_BOOT     = 10
 
-	// roles for loadClient
+	// roles
 	ROLE_FULL   = 0
 	ROLE_CLIENT = 1
 	ROLE_SERVER = 2
 )
 
+// -------------------- ONE "preset" only --------------------
+
+type defaultParametersLiteral struct {
+	CKKS ckks.ParametersLiteral
+	BOOT bootstrapping.ParametersLiteral
+}
+
+// IMPORTANT: this CKKS literal must match your intended preset shape.
+// If NewParametersFromLiteral fails, adjust LogQ/LogP to match your repo’s N16QP1546H192H32 definition.
+var N16QP1546H192H32 = defaultParametersLiteral{
+	CKKS: ckks.ParametersLiteral{
+		LogN:            16,
+		LogQ:            []int{60, 40, 40, 40, 40, 40, 40, 40, 40, 40},
+		LogP:            []int{61, 61, 61, 61, 61},
+		Xs:              ring.Ternary{H: 192},
+		LogDefaultScale: 40,
+	},
+	BOOT: bootstrapping.ParametersLiteral{},
+}
+
+func bootPreset() (name string, p defaultParametersLiteral) {
+	return "N16QP1546H192H32", N16QP1546H192H32
+}
+
 // -------------------- Context (gob) --------------------
 
 type Context struct {
+	ParamName string
 	ParamsLit ckks.ParametersLiteral
+	BootLit   bootstrapping.ParametersLiteral
 
-	// Keys
+	// test-only (includes SK for lazy keys + boot keys)
 	SK  rlwe.SecretKey
 	PK  rlwe.PublicKey
 	RLK rlwe.RelinearizationKey
@@ -97,7 +125,6 @@ type Context struct {
 // -------------------- VM --------------------
 
 type VM struct {
-	// role: FULL/CLIENT/SERVER
 	role int
 
 	// parsed from hevm file
@@ -115,7 +142,8 @@ type VM struct {
 	resLevel []uint64
 	resDst   []uint64
 
-	// ---- Lattigo objects ----
+	// ---- CKKS objects ----
+	paramName string
 	params    ckks.Parameters
 	encoder   *ckks.Encoder
 	encryptor *rlwe.Encryptor
@@ -126,16 +154,26 @@ type VM struct {
 	pk  *rlwe.PublicKey
 	rlk *rlwe.RelinearizationKey
 
-	// rotation keys (lazy): map rot -> key
+	// rotation keys (lazy for OP_ROTATEC)
 	gksMu sync.Mutex
 	gkMap map[int]*rlwe.GaloisKey
 	gks   []*rlwe.GaloisKey // flattened for NewMemEvaluationKeySet
 
-	// buffers
-	ciphers []rlwe.Ciphertext // ciphertext buffer
-	plains  []rlwe.Plaintext  // plaintext buffer
+	// ---- bootstrapping state ----
+	bootMu     sync.Mutex
+	bootInited bool
+	bootErr    error
 
-	// runtime flags
+	bootLit    bootstrapping.ParametersLiteral
+	bootParams bootstrapping.Parameters
+	bootEVK    *bootstrapping.EvaluationKeys // pointer
+	bootEval   *bootstrapping.Evaluator      // evaluator does Bootstrap
+
+	// buffers
+	ciphers []rlwe.Ciphertext
+	plains  []rlwe.Plaintext
+
+	// flags
 	debug bool
 	toGPU bool
 
@@ -242,33 +280,19 @@ func readConstantsBin(path string) ([][]float64, error) {
 	return out, nil
 }
 
-// -------------------- CKKS setup --------------------
+// -------------------- CKKS setup (single preset only) --------------------
 
-func defaultParamsLiteral() ckks.ParametersLiteral {
-	logN := 15
-	logQ := make([]int, 14)
-	for i := range logQ {
-		logQ[i] = 60
-	}
-	logP := []int{60, 60}
-	return ckks.ParametersLiteral{
-		LogN:            logN,
-		LogQ:            logQ,
-		LogP:            logP,
-		LogDefaultScale: 40,
-	}
-}
+func (v *VM) setupFromPresetNewKeys() error {
+	name, p := bootPreset()
+	v.paramName = name
+	v.bootLit = p.BOOT
 
-// FULL VM: create params + generate keys
-func (v *VM) setupCKKSFixedNewKeys() error {
-	pl := defaultParamsLiteral()
-
-	params, err := ckks.NewParametersFromLiteral(pl)
+	params, err := ckks.NewParametersFromLiteral(p.CKKS)
 	if err != nil {
 		return err
 	}
 	v.params = params
-	v.slots = 1 << (pl.LogN - 1)
+	v.slots = 1 << (p.CKKS.LogN - 1)
 
 	const encPrec = uint(53)
 	v.encoder = ckks.NewEncoder(params, encPrec)
@@ -280,15 +304,19 @@ func (v *VM) setupCKKSFixedNewKeys() error {
 	v.encryptor = ckks.NewEncryptor(params, v.pk)
 	v.decryptor = ckks.NewDecryptor(params, v.sk)
 
-	// evaluator initially with RLK only; rotations are lazy
 	v.resetRotationCache()
 	evk := rlwe.NewMemEvaluationKeySet(v.rlk)
 	v.evaluator = ckks.NewEvaluator(params, evk)
 
+	// boot lazy
+	v.bootInited = false
+	v.bootErr = nil
+	v.bootEVK = nil
+	v.bootEval = nil
+
 	return nil
 }
 
-// CLIENT/SERVER VM: load params + keys from context
 func (v *VM) setupFromContext(cx *Context) error {
 	if cx == nil {
 		return fmt.Errorf("nil context")
@@ -297,25 +325,32 @@ func (v *VM) setupFromContext(cx *Context) error {
 	if err != nil {
 		return err
 	}
+
+	v.paramName = cx.ParamName
+	v.bootLit = cx.BootLit
+
 	v.params = params
 	v.slots = 1 << (cx.ParamsLit.LogN - 1)
 
 	const encPrec = uint(53)
 	v.encoder = ckks.NewEncoder(params, encPrec)
 
-	// attach keys
 	v.sk = &cx.SK
 	v.pk = &cx.PK
 	v.rlk = &cx.RLK
 
-	// encryptor/decryptor
 	v.encryptor = ckks.NewEncryptor(params, v.pk)
 	v.decryptor = ckks.NewDecryptor(params, v.sk)
 
-	// evaluator initially with RLK only; rotations are lazy
 	v.resetRotationCache()
 	evk := rlwe.NewMemEvaluationKeySet(v.rlk)
 	v.evaluator = ckks.NewEvaluator(params, evk)
+
+	// boot lazy
+	v.bootInited = false
+	v.bootErr = nil
+	v.bootEVK = nil
+	v.bootEval = nil
 
 	return nil
 }
@@ -327,13 +362,11 @@ func (v *VM) resetRotationCache() {
 	v.gks = nil
 }
 
-// LAZY: only create the galois key for the exact rotation used.
 func (v *VM) ensureRotationKey(k int) {
-	if k == 0 {
+	if k == 0 || v.sk == nil {
 		return
 	}
 
-	// fast check
 	v.gksMu.Lock()
 	if v.gkMap == nil {
 		v.gkMap = make(map[int]*rlwe.GaloisKey)
@@ -344,17 +377,14 @@ func (v *VM) ensureRotationKey(k int) {
 	}
 	v.gksMu.Unlock()
 
-	// slow: generate outside lock
 	galEl := v.params.GaloisElementForRotation(k)
 	kgen := ckks.NewKeyGenerator(v.params)
-	// v6.1.1: returns []*rlwe.GaloisKey
 	gksOne := kgen.GenGaloisKeysNew([]uint64{galEl}, v.sk)
 	if len(gksOne) == 0 || gksOne[0] == nil {
 		return
 	}
 	gk := gksOne[0]
 
-	// commit + rebuild evaluator keyset
 	v.gksMu.Lock()
 	defer v.gksMu.Unlock()
 	if _, ok := v.gkMap[k]; ok {
@@ -365,6 +395,55 @@ func (v *VM) ensureRotationKey(k int) {
 
 	evk := rlwe.NewMemEvaluationKeySet(v.rlk, v.gks...)
 	v.evaluator = ckks.NewEvaluator(v.params, evk)
+}
+
+// -------------------- Boot init --------------------
+//
+// Fix for your current compile error:
+//   NewEvaluator expects *bootstrapping.EvaluationKeys
+// so pass `evk` (pointer), not `*evk` (value).
+
+func (v *VM) ensureBoot() error {
+	v.bootMu.Lock()
+	defer v.bootMu.Unlock()
+
+	if v.bootInited {
+		return v.bootErr
+	}
+	v.bootInited = true
+
+	if v.sk == nil {
+		v.bootErr = fmt.Errorf("boot: missing secret key (SK)")
+		return v.bootErr
+	}
+
+	btpParams, err := bootstrapping.NewParametersFromLiteral(v.params, v.bootLit)
+	if err != nil {
+		v.bootErr = fmt.Errorf("boot: NewParametersFromLiteral: %w", err)
+		return v.bootErr
+	}
+	v.bootParams = btpParams
+
+	// v6.1.1: returns (evk *EvaluationKeys, galKeys int, err)
+	evk, _, err := btpParams.GenEvaluationKeys(v.sk)
+	if err != nil {
+		v.bootErr = fmt.Errorf("boot: GenEvaluationKeys: %w", err)
+		return v.bootErr
+	}
+	v.bootEVK = evk
+
+	// IMPORTANT: pass pointer `evk` (NOT *evk)
+	eval, err := bootstrapping.NewEvaluator(btpParams, evk)
+	if err != nil {
+		v.bootErr = fmt.Errorf("boot: NewEvaluator: %w", err)
+		return v.bootErr
+	}
+	v.bootEval = eval
+
+	fmt.Printf("[LATTIGO_HEVM][BOOT] enabled PARAM=%s logN=%d slots=%d maxLevel=%d logScale=%d\n",
+		v.paramName, v.params.LogN(), v.slots, v.params.MaxLevel(), int(v.params.LogDefaultScale()))
+
+	return nil
 }
 
 // -------------------- helpers: encode constant -> plaintext --------------------
@@ -380,7 +459,6 @@ func (v *VM) encodeToPlainAt(dst *rlwe.Plaintext, values []float64, level int, l
 		}
 	}
 	v.encoder.Encode(vec, pt)
-
 	*dst = *pt
 }
 
@@ -419,7 +497,6 @@ func (v *VM) loadHEVM(path string) error {
 		return fmt.Errorf("bad magic: got 0x%x expect 0x%x", magic, kMagicHEVM)
 	}
 
-	// ConfigBody: 6*u64
 	cbl, err := readU64(f)
 	if err != nil {
 		return err
@@ -496,7 +573,6 @@ func (v *VM) loadHEVM(path string) error {
 		v.ops[i] = op
 	}
 
-	// allocate buffers for ct/pt (ct buffer also holds args+results as in SEAL runtime)
 	ctN := int(numCtxt)
 	ptN := int(numPtxt)
 	if ctN < aLen+rLen {
@@ -525,9 +601,7 @@ func (v *VM) loadHEVM(path string) error {
 
 // -------------------- Ciphertext handle exchange --------------------
 
-type CtxtBox struct {
-	CT rlwe.Ciphertext
-}
+type CtxtBox struct{ CT rlwe.Ciphertext }
 
 func exportCiphertextHandle(ct *rlwe.Ciphertext) C.uintptr_t {
 	if ct == nil {
@@ -590,9 +664,9 @@ func freeVM(h C.uintptr_t) {
 func create_context(path *C.char) C.uintptr_t {
 	p := C.GoString(path)
 
-	// create context: params + keys
-	pl := defaultParamsLiteral()
-	params, err := ckks.NewParametersFromLiteral(pl)
+	name, preset := bootPreset()
+
+	params, err := ckks.NewParametersFromLiteral(preset.CKKS)
 	if err != nil {
 		fmt.Printf("[LATTIGO_HEVM][ERR] create_context params: %v\n", err)
 		return 0
@@ -603,13 +677,14 @@ func create_context(path *C.char) C.uintptr_t {
 	rlk := kgen.GenRelinearizationKeyNew(sk)
 
 	cx := &Context{
-		ParamsLit: pl,
+		ParamName: name,
+		ParamsLit: preset.CKKS,
+		BootLit:   preset.BOOT,
 		SK:        *sk,
 		PK:        *pk,
 		RLK:       *rlk,
 	}
 
-	// write gob
 	if p != "" {
 		if f, err := os.Create(p); err == nil {
 			enc := gob.NewEncoder(f)
@@ -623,7 +698,7 @@ func create_context(path *C.char) C.uintptr_t {
 	}
 
 	h := cgo.NewHandle(cx)
-	fmt.Printf("[LATTIGO_HEVM] create_context path=%q handle=%d\n", p, uintptr(h))
+	fmt.Printf("[LATTIGO_HEVM] create_context preset=%s path=%q handle=%d\n", name, p, uintptr(h))
 	return C.uintptr_t(h)
 }
 
@@ -642,8 +717,8 @@ func loadClient(vmH C.uintptr_t, ctxH C.uintptr_t) {
 	if v == nil || cx == nil {
 		return
 	}
-	// role message (match your log style)
-	fmt.Printf("[LATTIGO_HEVM] loadClient vm=%d ctx=%d role=%d (handle)\n", uintptr(vmH), uintptr(ctxH), v.role)
+	fmt.Printf("[LATTIGO_HEVM] loadClient vm=%d ctx=%d role=%d preset=%s\n",
+		uintptr(vmH), uintptr(ctxH), v.role, cx.ParamName)
 
 	if err := v.setupFromContext(cx); err != nil {
 		fmt.Printf("[LATTIGO_HEVM][ERR] loadClient setup: %v\n", err)
@@ -669,9 +744,8 @@ func load(h C.uintptr_t, constPath *C.char, hevmPath *C.char) {
 	}
 	v.constants = consts
 
-	// Full VM creates keys here
-	if err := v.setupCKKSFixedNewKeys(); err != nil {
-		fmt.Printf("[LATTIGO_HEVM][ERR] setup CKKS: %v\n", err)
+	if err := v.setupFromPresetNewKeys(); err != nil {
+		fmt.Printf("[LATTIGO_HEVM][ERR] setup CKKS(preset): %v\n", err)
 		return
 	}
 
@@ -679,6 +753,9 @@ func load(h C.uintptr_t, constPath *C.char, hevmPath *C.char) {
 		fmt.Printf("[LATTIGO_HEVM][ERR] read hevm: %v\n", err)
 		return
 	}
+
+	fmt.Printf("[LATTIGO_HEVM] preset=%s logN=%d slots=%d maxLevel=%d logScale=%d\n",
+		v.paramName, v.params.LogN(), v.slots, v.params.MaxLevel(), int(v.params.LogDefaultScale()))
 }
 
 //export loadProgram
@@ -698,7 +775,6 @@ func loadProgram(h C.uintptr_t, constPath *C.char, hevmPath *C.char) {
 	}
 	v.constants = consts
 
-	// expect params/keys already present (from loadClient)
 	if (v.encoder == nil) || (v.evaluator == nil) || (v.params.LogN() == 0) {
 		fmt.Printf("[LATTIGO_HEVM][ERR] loadProgram: call loadClient() first\n")
 		return
@@ -709,10 +785,12 @@ func loadProgram(h C.uintptr_t, constPath *C.char, hevmPath *C.char) {
 		return
 	}
 
-	// ensure rotation cache starts empty for this program
 	v.resetRotationCache()
 	evk := rlwe.NewMemEvaluationKeySet(v.rlk)
 	v.evaluator = ckks.NewEvaluator(v.params, evk)
+
+	fmt.Printf("[LATTIGO_HEVM] preset=%s logN=%d slots=%d maxLevel=%d logScale=%d\n",
+		v.paramName, v.params.LogN(), v.slots, v.params.MaxLevel(), int(v.params.LogDefaultScale()))
 }
 
 //export preprocess
@@ -723,12 +801,10 @@ func preprocess(h C.uintptr_t) {
 	}
 	fmt.Printf("[LATTIGO_HEVM] preprocess handle=%d\n", uintptr(h))
 
-	// For opcode==ENCODE, encode constants into plains[dst] at given (level, scale)
 	for _, op := range v.ops {
 		if int(op.opcode) != OP_ENCODE {
 			continue
 		}
-
 		dst := int(op.dst)
 		lhs := int(op.lhs)
 		level := int(uint16(op.rhs) >> 10)
@@ -747,6 +823,9 @@ func preprocess(h C.uintptr_t) {
 			src = nil
 		}
 
+		if level > v.params.MaxLevel() {
+			level = v.params.MaxLevel()
+		}
 		v.encodeToPlainAt(&v.plains[dst], src, level, log2Scale)
 	}
 }
@@ -777,106 +856,137 @@ func run(h C.uintptr_t) {
 		case OP_ENCODE:
 			continue
 
-		case OP_ROTATEC: {
-			dst := int(op.dst)
-			src := int(op.lhs)
-			k := int(int16(op.rhs))
-			in, out := ctAt(src), ctAt(dst)
-			if in == nil || out == nil {
-				continue
+		case OP_ROTATEC:
+			{
+				dst := int(op.dst)
+				src := int(op.lhs)
+				k := int(int16(op.rhs))
+				in, out := ctAt(src), ctAt(dst)
+				if in == nil || out == nil {
+					continue
+				}
+				v.ensureRotationKey(k)
+				v.evaluator.Rotate(in, k, out)
 			}
-			// LAZY: only generate this rotation key when it is actually used
-			v.ensureRotationKey(k)
-			v.evaluator.Rotate(in, k, out)
-		}
 
-		case OP_NEGATEC: {
-			dst := int(op.dst)
-			src := int(op.lhs)
-			in, out := ctAt(src), ctAt(dst)
-			if in == nil || out == nil {
-				continue
+		case OP_NEGATEC:
+			{
+				dst := int(op.dst)
+				src := int(op.lhs)
+				in, out := ctAt(src), ctAt(dst)
+				if in == nil || out == nil {
+					continue
+				}
+				v.evaluator.Mul(in, -1.0, out)
 			}
-			v.evaluator.Mul(in, -1.0, out)
-		}
 
-		case OP_RESCALEC: {
-			dst := int(op.dst)
-			src := int(op.lhs)
-			in, out := ctAt(src), ctAt(dst)
-			if in == nil || out == nil {
-				continue
+		case OP_RESCALEC:
+			{
+				dst := int(op.dst)
+				src := int(op.lhs)
+				in, out := ctAt(src), ctAt(dst)
+				if in == nil || out == nil {
+					continue
+				}
+				v.evaluator.Rescale(in, out)
 			}
-			v.evaluator.Rescale(in, out)
-		}
 
-		case OP_MODSWC: {
-			dst := int(op.dst)
-			src := int(op.lhs)
-			down := int(op.rhs)
-			in, out := ctAt(src), ctAt(dst)
-			if in == nil || out == nil {
-				continue
+		case OP_MODSWC:
+			{
+				dst := int(op.dst)
+				src := int(op.lhs)
+				down := int(op.rhs)
+				in, out := ctAt(src), ctAt(dst)
+				if in == nil || out == nil {
+					continue
+				}
+				*out = *in
+				if down > 0 {
+					v.evaluator.DropLevel(out, down)
+				}
 			}
-			*out = *in
-			if down > 0 {
-				v.evaluator.DropLevel(out, down) // in-place
-			}
-		}
 
 		case OP_UPSCALEC:
 			continue
 
-		case OP_ADDCC: {
-			dst := int(op.dst)
-			l := int(op.lhs)
-			r := int(op.rhs)
-			in0, in1, out := ctAt(l), ctAt(r), ctAt(dst)
-			if in0 == nil || in1 == nil || out == nil {
-				continue
+		case OP_ADDCC:
+			{
+				dst := int(op.dst)
+				l := int(op.lhs)
+				r := int(op.rhs)
+				in0, in1, out := ctAt(l), ctAt(r), ctAt(dst)
+				if in0 == nil || in1 == nil || out == nil {
+					continue
+				}
+				in0.Scale = in1.Scale
+				v.evaluator.Add(in0, in1, out)
 			}
-			// SEAL-style metadata alignment
-			in0.Scale = in1.Scale
-			v.evaluator.Add(in0, in1, out)
-		}
 
-		case OP_ADDCP: {
-			dst := int(op.dst)
-			l := int(op.lhs)
-			p := int(op.rhs)
-			in0, pt, out := ctAt(l), ptAt(p), ctAt(dst)
-			if in0 == nil || pt == nil || out == nil {
-				continue
+		case OP_ADDCP:
+			{
+				dst := int(op.dst)
+				l := int(op.lhs)
+				p := int(op.rhs)
+				in0, pt, out := ctAt(l), ptAt(p), ctAt(dst)
+				if in0 == nil || pt == nil || out == nil {
+					continue
+				}
+				in0.Scale = pt.Scale
+				v.evaluator.Add(in0, pt, out)
 			}
-			// SEAL-style metadata alignment
-			in0.Scale = pt.Scale
-			v.evaluator.Add(in0, pt, out)
-		}
 
-		case OP_MULCC: {
-			dst := int(op.dst)
-			l := int(op.lhs)
-			r := int(op.rhs)
-			in0, in1, out := ctAt(l), ctAt(r), ctAt(dst)
-			if in0 == nil || in1 == nil || out == nil {
-				continue
+		case OP_MULCC:
+			{
+				dst := int(op.dst)
+				l := int(op.lhs)
+				r := int(op.rhs)
+				in0, in1, out := ctAt(l), ctAt(r), ctAt(dst)
+				if in0 == nil || in1 == nil || out == nil {
+					continue
+				}
+				v.evaluator.MulRelin(in0, in1, out)
 			}
-			v.evaluator.MulRelin(in0, in1, out)
-		}
 
-		case OP_MULCP: {
-			dst := int(op.dst)
-			l := int(op.lhs)
-			p := int(op.rhs)
-			in0, pt, out := ctAt(l), ptAt(p), ctAt(dst)
-			if in0 == nil || pt == nil || out == nil {
-				continue
+		case OP_MULCP:
+			{
+				dst := int(op.dst)
+				l := int(op.lhs)
+				p := int(op.rhs)
+				in0, pt, out := ctAt(l), ptAt(p), ctAt(dst)
+				if in0 == nil || pt == nil || out == nil {
+					continue
+				}
+				v.evaluator.Mul(in0, pt, out)
 			}
-			v.evaluator.Mul(in0, pt, out)
-		}
 
 		case OP_BOOT:
-			continue
+			{
+				dst := int(op.dst)
+				src := int(op.lhs)
+				targetLevel := int(op.rhs)
+
+				in, out := ctAt(src), ctAt(dst)
+				if in == nil || out == nil {
+					continue
+				}
+				if err := v.ensureBoot(); err != nil {
+					fmt.Printf("[LATTIGO_HEVM][BOOT][ERR] %v\n", err)
+					continue
+				}
+
+				booted, err := v.bootEval.Bootstrap(in)
+				if err != nil {
+					fmt.Printf("[LATTIGO_HEVM][BOOT][ERR] Bootstrap: %v\n", err)
+					continue
+				}
+				*out = *booted
+
+				if targetLevel >= 0 && targetLevel <= v.params.MaxLevel() {
+					if out.Level() > targetLevel {
+						v.evaluator.DropLevel(out, out.Level()-targetLevel)
+					}
+				}
+			}
 
 		default:
 			continue
@@ -1053,7 +1163,8 @@ func printMem(h C.uintptr_t) {
 	if v == nil {
 		return
 	}
-	fmt.Printf("[LATTIGO_HEVM] printMem handle=%d (ckks)\n", uintptr(h))
+	fmt.Printf("[LATTIGO_HEVM] printMem handle=%d preset=%s logN=%d slots=%d maxLevel=%d\n",
+		uintptr(h), v.paramName, v.params.LogN(), v.slots, v.params.MaxLevel())
 }
 
 func main() {}

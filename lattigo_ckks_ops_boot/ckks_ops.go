@@ -1,8 +1,3 @@
-// ckks_ops.go (完整文件：在你现有版本上补齐“密文 level/scale 查询”导出)
-// 注意：下面只展示与你当前接口一致的一个完整可编译版本骨架。
-// 你已有的 BootEnable / BootstrapTo 逻辑保留；这里重点新增：CKKS_CTLevel / CKKS_CTLog2Scale。
-// 若你文件里已存在同名函数，请以此为准合并。
-
 package main
 
 /*
@@ -19,7 +14,6 @@ import (
 	"unsafe"
 
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
-	"github.com/tuneinsight/lattigo/v6/ring"
 	"github.com/tuneinsight/lattigo/v6/schemes/ckks"
 
 	// bootstrapping
@@ -39,16 +33,14 @@ type VM struct {
 	sk  *rlwe.SecretKey
 	pk  *rlwe.PublicKey
 	rlk *rlwe.RelinearizationKey
-	gks *rlwe.GaloisKey
+
+	gkSingle *rlwe.GaloisKey
 
 	ct []rlwe.Ciphertext
 
-	// --- boot state ---
 	bootEnabled bool
-	bootParamID int // optional: just for prints
-	btpParams   bootstrapping.Parameters
-	btpKeys     *bootstrapping.EvaluationKeys
-	btpEval     *bootstrapping.Evaluator
+	btpParams   *bootstrapping.Parameters
+	bootEval    *bootstrapping.Evaluator
 }
 
 func getVM(h C.uintptr_t) *VM {
@@ -86,6 +78,33 @@ func (v *VM) ctAt(i int) *rlwe.Ciphertext {
 		v.ensureCT(i)
 	}
 	return &v.ct[i]
+}
+
+func (v *VM) resetWithParams(params ckks.Parameters, ctCapacity int) {
+	v.params = params
+	v.slots = params.MaxSlots()
+
+	const encPrec = uint(53)
+	v.encoder = ckks.NewEncoder(params, encPrec)
+
+	kgen := rlwe.NewKeyGenerator(params)
+	v.sk = kgen.GenSecretKeyNew()
+	v.pk = kgen.GenPublicKeyNew(v.sk)
+	v.rlk = kgen.GenRelinearizationKeyNew(v.sk)
+
+	v.encryptor = rlwe.NewEncryptor(params, v.pk)
+	v.decryptor = rlwe.NewDecryptor(params, v.sk)
+
+	evk := rlwe.NewMemEvaluationKeySet(v.rlk)
+	v.evaluator = ckks.NewEvaluator(params, evk)
+
+	v.gkSingle = nil
+
+	v.ct = make([]rlwe.Ciphertext, ctCapacity)
+	for i := 0; i < ctCapacity; i++ {
+		tmp := ckks.NewCiphertext(params, 1, params.MaxLevel())
+		v.ct[i] = *tmp
+	}
 }
 
 //export CKKS_CreateVM
@@ -128,32 +147,14 @@ func CKKS_CreateVM(logN C.int, levels C.int, logDefaultScale C.int, ctCapacity C
 	}
 
 	vm := &VM{}
-	vm.params = params
-	vm.slots = 1 << (ln - 1)
-
-	const encPrec = uint(53)
-	vm.encoder = ckks.NewEncoder(params, encPrec)
-
-	kgen := ckks.NewKeyGenerator(params)
-	sk, pk := kgen.GenKeyPairNew()
-	vm.sk, vm.pk = sk, pk
-	vm.rlk = kgen.GenRelinearizationKeyNew(sk)
-
-	vm.encryptor = rlwe.NewEncryptor(params, pk)
-	vm.decryptor = rlwe.NewDecryptor(params, sk)
-
-	evk := rlwe.NewMemEvaluationKeySet(vm.rlk)
-	vm.evaluator = ckks.NewEvaluator(params, evk)
-
-	vm.ct = make([]rlwe.Ciphertext, capN)
-	for i := 0; i < capN; i++ {
-		tmp := ckks.NewCiphertext(params, 1, params.MaxLevel())
-		vm.ct[i] = *tmp
-	}
+	vm.resetWithParams(params, capN)
+	vm.bootEnabled = false
+	vm.btpParams = nil
+	vm.bootEval = nil
 
 	h := cgo.NewHandle(vm)
 	fmt.Printf("[CKKS] CreateVM handle=%d logN=%d slots=%d levels=%d logScale=%d ctCap=%d\n",
-		uintptr(h), ln, vm.slots, lv, lds, capN)
+		uintptr(h), params.LogN(), params.MaxSlots(), params.MaxLevel()+1, params.LogDefaultScale(), capN)
 	return C.uintptr_t(h)
 }
 
@@ -201,8 +202,6 @@ func CKKS_LogDefaultScale(h C.uintptr_t) C.int {
 	return C.int(v.params.LogDefaultScale())
 }
 
-// -------- NEW: ciphertext metadata exports --------
-
 //export CKKS_CTLevel
 func CKKS_CTLevel(h C.uintptr_t, idx C.int) C.int {
 	v := getVM(h)
@@ -220,14 +219,33 @@ func CKKS_CTLevel(h C.uintptr_t, idx C.int) C.int {
 func CKKS_CTLog2Scale(h C.uintptr_t, idx C.int) C.int {
 	v := getVM(h)
 	if v == nil {
-		return 0
+		return -1
 	}
 	ct := v.ctAt(int(idx))
 	if ct == nil || ct.Value == nil {
-		return 0
+		return -1
 	}
-	// use float64 approximation for logging
-	return C.int(math.Round(math.Log2(ct.Scale.Float64())))
+	ls := math.Log2(ct.Scale.Float64())
+	return C.int(int(math.Round(ls)))
+}
+
+//export CKKS_GenRotKey
+func CKKS_GenRotKey(h C.uintptr_t, rot C.int) {
+	v := getVM(h)
+	if v == nil {
+		return
+	}
+	k := int(rot)
+	if k == 0 {
+		return
+	}
+
+	kgen := rlwe.NewKeyGenerator(v.params)
+	galEl := v.params.GaloisElementForRotation(k)
+	v.gkSingle = kgen.GenGaloisKeyNew(galEl, v.sk)
+
+	evk := rlwe.NewMemEvaluationKeySet(v.rlk, v.gkSingle)
+	v.evaluator = ckks.NewEvaluator(v.params, evk)
 }
 
 //export CKKS_EncryptTo
@@ -273,9 +291,8 @@ func CKKS_DecryptFrom(h C.uintptr_t, src C.int, out *C.double, outN C.int) {
 	if v == nil || out == nil {
 		return
 	}
-	s := int(src)
-	ct := v.ctAt(s)
-	if ct == nil {
+	ct := v.ctAt(int(src))
+	if ct == nil || ct.Value == nil {
 		return
 	}
 
@@ -306,7 +323,43 @@ func CKKS_OpMulCC(h C.uintptr_t, dst, a, b C.int) {
 		return
 	}
 	v.ensureCT(int(dst))
-	v.evaluator.MulRelin(v.ctAt(int(a)), v.ctAt(int(b)), v.ctAt(int(dst)))
+	ctA := v.ctAt(int(a))
+	ctB := v.ctAt(int(b))
+	ctD := v.ctAt(int(dst))
+	if ctA == nil || ctB == nil || ctD == nil {
+		return
+	}
+	if err := v.evaluator.MulRelin(ctA, ctB, ctD); err != nil {
+		fmt.Printf("[CKKS][ERR] MulRelin: %v\n", err)
+	}
+}
+
+//export CKKS_OpMulCP_Const
+func CKKS_OpMulCP_Const(h C.uintptr_t, dst, a C.int, c C.double) {
+	v := getVM(h)
+	if v == nil {
+		return
+	}
+	v.ensureCT(int(dst))
+
+	in := v.ctAt(int(a))
+	out := v.ctAt(int(dst))
+	if in == nil || out == nil {
+		return
+	}
+
+	pt := ckks.NewPlaintext(v.params, in.Level())
+	pt.Scale = in.Scale
+
+	vec := make([]complex128, v.slots)
+	for i := 0; i < v.slots; i++ {
+		vec[i] = complex(float64(c), 0)
+	}
+	v.encoder.Encode(vec, pt)
+
+	if err := v.evaluator.Mul(in, pt, out); err != nil {
+		fmt.Printf("[CKKS][ERR] Mul(ct,pt): %v\n", err)
+	}
 }
 
 //export CKKS_OpRescale
@@ -316,10 +369,29 @@ func CKKS_OpRescale(h C.uintptr_t, dst, a C.int) {
 		return
 	}
 	v.ensureCT(int(dst))
-	v.evaluator.Rescale(v.ctAt(int(a)), v.ctAt(int(dst)))
+	if err := v.evaluator.Rescale(v.ctAt(int(a)), v.ctAt(int(dst))); err != nil {
+		fmt.Printf("[CKKS][ERR] Rescale: %v\n", err)
+	}
 }
 
-// ---------------- boot API (你已有的实现；这里只给一个可工作形态) ----------------
+//export CKKS_OpDropLevel
+func CKKS_OpDropLevel(h C.uintptr_t, dst, a, down C.int) {
+	v := getVM(h)
+	if v == nil {
+		return
+	}
+	v.ensureCT(int(dst))
+	*v.ctAt(int(dst)) = *v.ctAt(int(a))
+	d := int(down)
+	if d > 0 {
+		// v6 DropLevel: no return value
+		v.evaluator.DropLevel(v.ctAt(int(dst)), d)
+	}
+}
+
+//
+// -------- Boot --------
+//
 
 //export CKKS_BootEnable
 func CKKS_BootEnable(h C.uintptr_t) C.int {
@@ -327,76 +399,55 @@ func CKKS_BootEnable(h C.uintptr_t) C.int {
 	if v == nil {
 		return 0
 	}
-	if v.bootEnabled {
-		return 1
-	}
 
-	// 强制使用你指定的默认参数：N16QP1546H192H32
-	// 这段 literal 必须与 lattigo circuits/ckks/bootstrapping 的默认参数一致（你已经贴了那段）
-	residual := ckks.ParametersLiteral{
-		LogN:            16,
-		LogQ:            []int{60, 40, 40, 40, 40, 40, 40, 40, 40, 40},
-		LogP:            []int{61, 61, 61, 61, 61},
-		Xs:              ring.Ternary{H: 192},
-		LogDefaultScale: 40,
-	}
-	params, err := ckks.NewParametersFromLiteral(residual)
+	ps := bootstrapping.N16QP1546H192H32
+
+	// scheme params
+	residualParams, err := ckks.NewParametersFromLiteral(ps.SchemeParams)
 	if err != nil {
-		fmt.Printf("[CKKS][BOOT][ERR] NewParametersFromLiteral(residual): %v\n", err)
+		fmt.Printf("[CKKS][BOOT][ERR] NewParametersFromLiteral(scheme): %v\n", err)
 		return 0
 	}
 
-	// build boot params from literal defaults (ParametersLiteral{} means default boot settings for this residual set)
-	btpParams, err := bootstrapping.NewParametersFromLiteral(params, bootstrapping.ParametersLiteral{})
+	// boot params (value type)
+	btpParamsVal, err := bootstrapping.NewParametersFromLiteral(residualParams, ps.BootstrappingParams)
 	if err != nil {
 		fmt.Printf("[CKKS][BOOT][ERR] NewParametersFromLiteral(boot): %v\n", err)
 		return 0
 	}
 
-	// regen keys under new params
-	kgen := rlwe.NewKeyGenerator(btpParams.BootstrappingParameters)
-	sk := kgen.GenSecretKeyNew()
+	// IMPORTANT: use the SAME parameter domain for all ops:
+	// Use BootstrappingParameters as your sole params.
+	vmParams := btpParamsVal.BootstrappingParameters
 
-	// boot keys (includes relinearization + galois + switching keys)
-	btpKeys, _, err := btpParams.GenEvaluationKeys(sk)
+	ctCap := len(v.ct)
+	if ctCap <= 0 {
+		ctCap = 32
+	}
+
+	// reset VM
+	v.resetWithParams(vmParams, ctCap)
+
+	// generate boot keys under the SAME sk (current sk is from vmParams)
+	btpKeys, _, err := btpParamsVal.GenEvaluationKeys(v.sk)
 	if err != nil {
 		fmt.Printf("[CKKS][BOOT][ERR] GenEvaluationKeys: %v\n", err)
 		return 0
 	}
-	eval, err := bootstrapping.NewEvaluator(btpParams, btpKeys)
+
+	bootEval, err := bootstrapping.NewEvaluator(btpParamsVal, btpKeys)
 	if err != nil {
 		fmt.Printf("[CKKS][BOOT][ERR] NewEvaluator: %v\n", err)
 		return 0
 	}
 
-	// rebuild VM state
-	v.params = params
-	v.slots = 1 << (params.LogN() - 1)
-	v.sk = sk
-	v.pk = kgen.GenPublicKeyNew(sk)
-	v.rlk = kgen.GenRelinearizationKeyNew(sk)
-
-	v.encoder = ckks.NewEncoder(params, 53)
-	v.encryptor = rlwe.NewEncryptor(params, v.pk)
-	v.decryptor = rlwe.NewDecryptor(params, v.sk)
-
-	// evaluator needs rlk at least (for MulRelin outside boot)
-	evk := rlwe.NewMemEvaluationKeySet(v.rlk)
-	v.evaluator = ckks.NewEvaluator(params, evk)
-
-	v.btpParams = btpParams
-	v.btpKeys = btpKeys
-	v.btpEval = eval
 	v.bootEnabled = true
-
-	// re-init ciphertext buffer to new params
-	for i := range v.ct {
-		tmp := ckks.NewCiphertext(params, 1, params.MaxLevel())
-		v.ct[i] = *tmp
-	}
+	// store pointer (take address)
+	v.btpParams = &btpParamsVal
+	v.bootEval = bootEval
 
 	fmt.Printf("[CKKS][BOOT] enabled PARAM=N16QP1546H192H32 logN=%d slots=%d maxLevel=%d logScale=%d\n",
-		params.LogN(), v.slots, params.MaxLevel(), params.LogDefaultScale())
+		v.params.LogN(), v.params.MaxSlots(), v.params.MaxLevel(), v.params.LogDefaultScale())
 
 	return 1
 }
@@ -404,28 +455,35 @@ func CKKS_BootEnable(h C.uintptr_t) C.int {
 //export CKKS_BootstrapTo
 func CKKS_BootstrapTo(h C.uintptr_t, dst, src C.int) C.int {
 	v := getVM(h)
-	if v == nil || !v.bootEnabled || v.btpEval == nil {
+	if v == nil || !v.bootEnabled || v.bootEval == nil {
 		return 0
 	}
-	v.ensureCT(int(dst))
+
 	in := v.ctAt(int(src))
-	out := v.ctAt(int(dst))
-	if in == nil || out == nil {
+	if in == nil || in.Value == nil {
 		return 0
 	}
 
-	// IMPORTANT: Boot evaluator expects ciphertext over v.params (residual scheme params)
-	// It also generally expects input at level 0 (depending on implementation).
-	// The boot evaluator in Lattigo handles level normalization internally, but to be safe you can:
-	// - drop to level 0 before boot if needed.
-	// Here we directly call Bootstrap; your earlier logs show it works with your flow.
+	v.ensureCT(int(dst))
+	out := v.ctAt(int(dst))
+	if out == nil {
+		return 0
+	}
 
-	ct, err := v.btpEval.Bootstrap(in)
+	// Many default boot parameter sets expect level 0 input.
+	tmp := *in
+	if tmp.Level() > 0 {
+		// DropLevel to 0 (no return value in v6)
+		v.evaluator.DropLevel(&tmp, tmp.Level())
+	}
+
+	ctOut, err := v.bootEval.Bootstrap(&tmp)
 	if err != nil {
 		fmt.Printf("[CKKS][BOOT][ERR] Bootstrap: %v\n", err)
 		return 0
 	}
-	*out = *ct
+
+	*out = *ctOut
 	return 1
 }
 

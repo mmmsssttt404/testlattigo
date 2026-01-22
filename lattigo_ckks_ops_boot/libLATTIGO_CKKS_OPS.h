@@ -21,7 +21,7 @@ extern const char *_GoStringPtr(_GoString_ s);
 /* Start of preamble from import "C" comments.  */
 
 
-#line 8 "ckks_ops.go"
+#line 3 "ckks_ops.go"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -97,10 +97,13 @@ extern int CKKS_MaxLevel(uintptr_t h);
 extern int CKKS_LogDefaultScale(uintptr_t h);
 extern int CKKS_CTLevel(uintptr_t h, int idx);
 extern int CKKS_CTLog2Scale(uintptr_t h, int idx);
+extern void CKKS_GenRotKey(uintptr_t h, int rot);
 extern void CKKS_EncryptTo(uintptr_t h, int dst, double* data, int n, int level, int log2Scale);
 extern void CKKS_DecryptFrom(uintptr_t h, int src, double* out, int outN);
 extern void CKKS_OpMulCC(uintptr_t h, int dst, int a, int b);
+extern void CKKS_OpMulCP_Const(uintptr_t h, int dst, int a, double c);
 extern void CKKS_OpRescale(uintptr_t h, int dst, int a);
+extern void CKKS_OpDropLevel(uintptr_t h, int dst, int a, int down);
 extern int CKKS_BootEnable(uintptr_t h);
 extern int CKKS_BootstrapTo(uintptr_t h, int dst, int src);
 
