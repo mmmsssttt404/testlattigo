@@ -21,7 +21,7 @@ extern const char *_GoStringPtr(_GoString_ s);
 /* Start of preamble from import "C" comments.  */
 
 
-#line 6 "hevm_stub.go"
+#line 14 "hevm_stub.go"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -121,9 +121,11 @@ extern uintptr_t initFullVM(char* path, _Bool useGPU);
 extern uintptr_t initClientVM(char* path);
 extern uintptr_t initServerVM(char* path);
 extern void freeVM(uintptr_t h);
-extern void create_context(char* path);
+extern uintptr_t create_context(char* path);
+extern void freeContext(uintptr_t h);
+extern void loadClient(uintptr_t vmH, uintptr_t ctxH);
 extern void load(uintptr_t h, char* constPath, char* hevmPath);
-extern void loadClient(uintptr_t h, uintptr_t ctx);
+extern void loadProgram(uintptr_t h, char* constPath, char* hevmPath);
 extern void preprocess(uintptr_t h);
 extern void run(uintptr_t h);
 extern int64_t getArgLen(uintptr_t h);
@@ -132,7 +134,9 @@ extern void encrypt(uintptr_t h, int64_t idx, double* data, int n);
 extern void decrypt(uintptr_t h, int64_t idx, double* out);
 extern void decrypt_result(uintptr_t h, int64_t resIdx, double* out);
 extern int64_t getResIdx(uintptr_t h, int64_t i);
-extern void* getCtxt(uintptr_t h, int64_t i);
+extern uintptr_t getCtxt(uintptr_t h, int64_t i);
+extern void setCtxt(uintptr_t h, int64_t i, uintptr_t ctH);
+extern void freeCtxt(uintptr_t ctH);
 extern void setDebug(uintptr_t h, _Bool enable);
 extern void setToGPU(uintptr_t h, _Bool ongpu);
 extern void printMem(uintptr_t h);
