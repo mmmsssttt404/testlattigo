@@ -1,4 +1,4 @@
-# test_hevm_ops.py
+# test_hevm_ops.py (fixed ABI bindings for EncryptTo/decrypt_result)
 import ctypes
 import os
 import struct
@@ -8,7 +8,6 @@ import math
 SO = "./libLATTIGO_HEVM.so"
 OUTN = 1 << 14
 
-# Opcodes (must match hevm_stub.go)
 OP_ENCODE   = 0
 OP_ROTATEC  = 1
 OP_NEGATEC  = 2
@@ -21,14 +20,11 @@ OP_MULCC    = 8
 OP_MULCP    = 9
 OP_BOOT     = 10
 
-# Go stub fixed params:
-# LogN=15, LogQ len = 14 => MaxLevel = 13 (0..13)
-MAX_LEVEL = 13
-DEFAULT_LOG2SCALE = 40
+MAX_LEVEL = int(os.environ.get("HEVM_MAX_LEVEL", "9"))
+DEFAULT_LOG2SCALE = int(os.environ.get("HEVM_LOG2SCALE", "40"))
 
 
 def pack_encode_rhs(level: int, log2scale: int) -> int:
-    # rhs packs: level = rhs>>10, scale=rhs & 0x3FF
     if not (0 <= level <= 0x3F):
         raise ValueError("level out of range")
     if not (0 <= log2scale <= 0x3FF):
@@ -80,24 +76,98 @@ def write_hevm(path, *, arg_len, res_len,
                                 lhs & 0xFFFF, rhs & 0xFFFF))
 
 
+def _pick_symbol(lib, names):
+    for n in names:
+        if hasattr(lib, n):
+            return getattr(lib, n), n
+    return None, None
+
+
 def load_lib():
     lib = ctypes.CDLL(SO)
 
-    # handle-based ABI
-    lib.initFullVM.argtypes = [ctypes.c_char_p, ctypes.c_bool]
-    lib.initFullVM.restype = ctypes.c_size_t
+    initFullVM, _ = _pick_symbol(lib, ["initFullVM"])
+    if initFullVM is None:
+        raise RuntimeError("Missing symbol: initFullVM")
+    initFullVM.argtypes = [ctypes.c_char_p, ctypes.c_bool]
+    initFullVM.restype = ctypes.c_size_t
 
-    lib.load.argtypes = [ctypes.c_size_t, ctypes.c_char_p, ctypes.c_char_p]
-    lib.preprocess.argtypes = [ctypes.c_size_t]
-    lib.run.argtypes = [ctypes.c_size_t]
+    load_fn, _ = _pick_symbol(lib, ["load"])
+    preprocess_fn, _ = _pick_symbol(lib, ["preprocess"])
+    run_fn, _ = _pick_symbol(lib, ["run"])
+    if not (load_fn and preprocess_fn and run_fn):
+        raise RuntimeError("Missing required symbols: load/preprocess/run")
+    load_fn.argtypes = [ctypes.c_size_t, ctypes.c_char_p, ctypes.c_char_p]
+    preprocess_fn.argtypes = [ctypes.c_size_t]
+    run_fn.argtypes = [ctypes.c_size_t]
 
-    lib.encrypt.argtypes = [ctypes.c_size_t, ctypes.c_int64, ctypes.POINTER(ctypes.c_double), ctypes.c_int]
-    lib.decrypt_result.argtypes = [ctypes.c_size_t, ctypes.c_int64, ctypes.POINTER(ctypes.c_double)]
+    # Encrypt:
+    #   EncryptTo(h, dst, data_ptr, n, level, log2Scale)
+    # legacy:
+    #   encrypt(h, dst, data_ptr, n)  (defaults)
+    enc_fn, enc_name = _pick_symbol(lib, ["EncryptTo", "encrypt"])
+    if enc_fn is None:
+        raise RuntimeError("Missing encrypt symbol (EncryptTo/encrypt)")
 
-    if hasattr(lib, "freeVM"):
-        lib.freeVM.argtypes = [ctypes.c_size_t]
+    if enc_name == "EncryptTo":
+        enc_fn.argtypes = [
+            ctypes.c_size_t, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_double), ctypes.c_int,
+            ctypes.c_int, ctypes.c_int
+        ]
 
-    return lib
+        def encrypt_call(h, dst, vec, n, level, logS):
+            enc_fn(h, int(dst), vec, int(n), int(level), int(logS))
+    else:
+        enc_fn.argtypes = [
+            ctypes.c_size_t, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_double), ctypes.c_int
+        ]
+
+        def encrypt_call(h, dst, vec, n, level, logS):
+            enc_fn(h, int(dst), vec, int(n))
+
+    # Decrypt:
+    #   decrypt_result(h, resIdx, out_ptr, n)
+    # legacy:
+    #   decrypt(h, resIdx, out_ptr) (writes 8)
+    dec_fn, dec_name = _pick_symbol(lib, ["decrypt_result", "decrypt", "DecryptFrom"])
+    if dec_fn is None:
+        raise RuntimeError("Missing decrypt symbol (decrypt_result/decrypt/DecryptFrom)")
+
+    if dec_name == "decrypt_result":
+        dec_fn.argtypes = [ctypes.c_size_t, ctypes.c_int64, ctypes.POINTER(ctypes.c_double), ctypes.c_int]
+
+        def decrypt_call(h, res_idx, outbuf, n):
+            dec_fn(h, int(res_idx), outbuf, int(n))
+    elif dec_name == "decrypt":
+        dec_fn.argtypes = [ctypes.c_size_t, ctypes.c_int64, ctypes.POINTER(ctypes.c_double)]
+
+        def decrypt_call(h, res_idx, outbuf, n):
+            dec_fn(h, int(res_idx), outbuf)
+    else:
+        # DecryptFrom(h, src_ct_idx, out_ptr, n)
+        dec_fn.argtypes = [ctypes.c_size_t, ctypes.c_int, ctypes.POINTER(ctypes.c_double), ctypes.c_int]
+
+        def decrypt_call(h, res_idx, outbuf, n):
+            # treat res_idx as ciphertext buffer index
+            dec_fn(h, int(res_idx), outbuf, int(n))
+
+    freeVM, _ = _pick_symbol(lib, ["freeVM"])
+    if freeVM is not None:
+        freeVM.argtypes = [ctypes.c_size_t]
+
+    return {
+        "lib": lib,
+        "initFullVM": initFullVM,
+        "load": load_fn,
+        "preprocess": preprocess_fn,
+        "run": run_fn,
+        "encrypt_call": encrypt_call,
+        "decrypt_call": decrypt_call,
+        "freeVM": freeVM,
+        "sym": {"encrypt": enc_name, "decrypt": dec_name},
+    }
 
 
 def assert_close(a, b, eps=1e-7):
@@ -106,7 +176,7 @@ def assert_close(a, b, eps=1e-7):
     raise AssertionError(f"not close: {a} vs {b} (eps={eps})")
 
 
-def run_program(lib, const_vectors, hevm_ops, *, res_dst0, input_vec,
+def run_program(api, const_vectors, hevm_ops, *, res_dst0, input_vec,
                 arg_log2scale=DEFAULT_LOG2SCALE,
                 arg_level=MAX_LEVEL):
     with tempfile.TemporaryDirectory() as d:
@@ -116,7 +186,6 @@ def run_program(lib, const_vectors, hevm_ops, *, res_dst0, input_vec,
 
         arg_len = 1
         res_len = 1
-
         num_ctxt_buffer = 8
         num_ptxt_buffer = 4
 
@@ -138,42 +207,33 @@ def run_program(lib, const_vectors, hevm_ops, *, res_dst0, input_vec,
             ops=hevm_ops
         )
 
-        h = lib.initFullVM(b".", False)
-        lib.load(h, const_path.encode(), hevm_path.encode())
+        h = api["initFullVM"](b".", False)
+        api["load"](h, const_path.encode(), hevm_path.encode())
+        api["preprocess"](h)
 
         x = (ctypes.c_double * len(input_vec))(*[float(v) for v in input_vec])
-        lib.encrypt(h, 0, x, len(input_vec))
+        api["encrypt_call"](h, 0, x, len(input_vec), arg_level, arg_log2scale)
 
-        lib.preprocess(h)
-        lib.run(h)
+        api["run"](h)
 
         outbuf = (ctypes.c_double * OUTN)()
-        lib.decrypt_result(h, 0, outbuf)
-
+        api["decrypt_call"](h, 0, outbuf, OUTN)
         out8 = [float(outbuf[i]) for i in range(8)]
 
-        if hasattr(lib, "freeVM"):
-            lib.freeVM(h)
+        if api["freeVM"] is not None:
+            api["freeVM"](h)
 
         return out8
 
 
 def test_mulcp_then_rotate():
-    """
-    Mul by 2 then Rotate(+1).
-
-    IMPORTANT:
-    Your Go stub uses Lattigo evaluator.Rotate(in, k, out).
-    In your current build, k=+1 behaves as LEFT rotate by 1:
-        [2,4,6,8] -> [4,6,8,2]
-    """
     consts = [[2.0]]
     rhs_encode = pack_encode_rhs(level=MAX_LEVEL, log2scale=DEFAULT_LOG2SCALE)
 
     ops = [
-        (OP_ENCODE,   0, 0, rhs_encode),        # plains[0] = 2 at (MAX_LEVEL, 2^40)
-        (OP_MULCP,    1, 0, 0),                 # ct1 = ct0 * plain0
-        (OP_ROTATEC,  2, 1, (1 & 0xFFFF)),      # ct2 = rotate(ct1, +1)
+        (OP_ENCODE,   0, 0, rhs_encode),
+        (OP_MULCP,    1, 0, 0),
+        (OP_ROTATEC,  2, 1, (1 & 0xFFFF)),
     ]
 
     out8 = run_program(
@@ -186,12 +246,10 @@ def test_mulcp_then_rotate():
         arg_log2scale=DEFAULT_LOG2SCALE,
     )
 
-    # LEFT rotate by 1: [2,4,6,8] -> [4,6,8,2]
     assert_close(out8[0], 4.0)
     assert_close(out8[1], 6.0)
     assert_close(out8[2], 8.0)
     assert_close(out8[3], 2.0)
-
     print("[PASS] test_mulcp_then_rotate, out[0:8] =", out8)
 
 
@@ -216,7 +274,6 @@ def test_addcc_then_negate():
     assert_close(out8[1], -4.0)
     assert_close(out8[2], -6.0)
     assert_close(out8[3], -8.0)
-
     print("[PASS] test_addcc_then_negate, out[0:8] =", out8)
 
 
@@ -225,8 +282,8 @@ def test_addcp_with_constant():
     rhs_encode = pack_encode_rhs(level=MAX_LEVEL, log2scale=DEFAULT_LOG2SCALE)
 
     ops = [
-        (OP_ENCODE, 0, 0, rhs_encode),  # plains[0] = 10 at (MAX_LEVEL, 2^40)
-        (OP_ADDCP,  1, 0, 0),           # ct1 = ct0 + plain0
+        (OP_ENCODE, 0, 0, rhs_encode),
+        (OP_ADDCP,  1, 0, 0),
     ]
 
     out8 = run_program(
@@ -243,11 +300,14 @@ def test_addcp_with_constant():
     assert_close(out8[1], 12.0)
     assert_close(out8[2], 13.0)
     assert_close(out8[3], 14.0)
-
     print("[PASS] test_addcp_with_constant, out[0:8] =", out8)
 
 
 def main():
+    api = load_lib()
+    print(f"[INFO] Using symbols: encrypt={api['sym']['encrypt']} decrypt={api['sym']['decrypt']}")
+    print(f"[INFO] MAX_LEVEL={MAX_LEVEL} DEFAULT_LOG2SCALE={DEFAULT_LOG2SCALE}")
+
     test_mulcp_then_rotate()
     test_addcc_then_negate()
     test_addcp_with_constant()

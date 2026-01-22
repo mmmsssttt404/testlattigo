@@ -21,13 +21,11 @@ extern const char *_GoStringPtr(_GoString_ s);
 /* Start of preamble from import "C" comments.  */
 
 
-#line 14 "hevm_stub.go"
+#line 13 "hevm_stub.go"
 
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdbool.h>
-
-// C-equivalent structs (match HEVMHeader.h binary layout)
 
 typedef struct {
     uint32_t magic_number;      // 0x4845564D
@@ -44,7 +42,7 @@ typedef struct {
     uint64_t num_ctxt_buffer;
     uint64_t num_ptxt_buffer;
     uint64_t init_level;
-    uint64_t reserved; // some tools read 6*u64
+    uint64_t reserved;
 } ConfigBody;
 
 typedef struct {
@@ -128,11 +126,23 @@ extern void load(uintptr_t h, char* constPath, char* hevmPath);
 extern void loadProgram(uintptr_t h, char* constPath, char* hevmPath);
 extern void preprocess(uintptr_t h);
 extern void run(uintptr_t h);
+extern int BootEnable(uintptr_t h);
+extern void EncryptTo(uintptr_t h, int dst, double* data, int n, int level, int log2Scale);
+extern void DecryptFrom(uintptr_t h, int src, double* out, int n);
+extern int CTLevel(uintptr_t h, int idx);
+extern int CTLog2Scale(uintptr_t h, int idx);
+extern void OpAddCC(uintptr_t h, int dst, int a, int b);
+extern void OpMulCC(uintptr_t h, int dst, int a, int b);
+extern void OpRescale(uintptr_t h, int dst, int src);
+extern void OpRotate(uintptr_t h, int dst, int src, int k);
+extern int BootstrapTo(uintptr_t h, int dst, int src);
+extern int Slots(uintptr_t h);
+extern int LogN(uintptr_t h);
+extern int MaxLevel(uintptr_t h);
+extern int LogDefaultScale(uintptr_t h);
 extern int64_t getArgLen(uintptr_t h);
 extern int64_t getResLen(uintptr_t h);
-extern void encrypt(uintptr_t h, int64_t idx, double* data, int n);
-extern void decrypt(uintptr_t h, int64_t idx, double* out);
-extern void decrypt_result(uintptr_t h, int64_t resIdx, double* out);
+extern void decrypt_result(uintptr_t h, int64_t resIdx, double* out, int n);
 extern int64_t getResIdx(uintptr_t h, int64_t i);
 extern uintptr_t getCtxt(uintptr_t h, int64_t i);
 extern void setCtxt(uintptr_t h, int64_t i, uintptr_t ctH);
