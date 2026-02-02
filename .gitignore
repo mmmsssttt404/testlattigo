@@ -6,3 +6,7 @@ go_readhevm/_hecate_ResNet.cst
 *.cst
 *.hevm
 
+
+# generated artifacts
+*.cst
+*.hevm
