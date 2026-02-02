@@ -1,12 +1,28 @@
-// hevm_stub.go (Lattigo v6.1.1)
-// Goal:
-// - Keep your original framework (HEVM program load/run + standalone ops ABI + client/server/context path)
-// - UNIFY: use BootstrappingParameters as VM's ONLY params domain everywhere
-//   => All Encrypt/Add/Mul/Rescale/Rotate/Boot run under the same ckks.Parameters (btpParams.BootstrappingParameters)
-// - BootEnable/BootstrapTo can be called standalone (no program required)
-// - SAFE decrypt: caller provides output length n
+// hevm_stub.go (Lattigo v6.1.1) — HEVM ABI aligned to HEaaN backend style
 //
-// Build: go build -buildmode=c-shared -o libLATTIGO_HEVM.so hevm_stub.go
+// Build:
+//   go build -buildmode=c-shared -o libLATTIGO_HEVM.so hevm_stub.go
+//
+// ABI compatibility goal:
+// - Exported C function NAMES match the HEaaN reference:
+//     initFullVM / initClientVM / initServerVM / create_context
+//     load / loadClient / encrypt / decrypt / decrypt_result / getResIdx / getCtxt
+//     preprocess / run / getArgLen / getResLen / setDebug / setToGPU / printMem
+// - Internal op handlers are methods (rotate/negate/rescale/modswitch/upscale/addcc/addcp/mulcc/mulcp/bootstrap)
+//   and run() dispatches to them (no big switch bodies).
+//
+// Notes:
+// - Because Go cannot hand out pointers to Go-managed memory to C, all "void* handles"
+//   are implemented as C-malloc'ed pointers holding a cgo.Handle integer.
+//   => freeVM/freeContext/freeCtxt must be called to avoid leaks.
+// - loadClient(void* vm, void* is) in HEaaN takes an std::istream*. Here we accept:
+//     *is == NULL  => no-op
+//     *is != NULL  => treat is as (char*) path to a .hevm file and load ONLY the header/metadata part.
+//   If you don't need header-only loading, you can ignore loadClient and just call load().
+//
+// - Params domain is UNIFIED: VM ops run under BootstrappingParameters domain (btp.BootstrappingParameters).
+//
+// - Upscale is not supported (assert-like error message).
 
 package main
 
@@ -17,7 +33,7 @@ package main
 
 typedef struct {
     uint32_t magic_number;      // 0x4845564D
-    uint32_t hevm_header_size;  // 8 + sizeof(ConfigHeader)
+    uint32_t hevm_header_size;  // 8 + sizeof(config_header)
     struct {
         uint64_t arg_length;
         uint64_t res_length;
@@ -39,7 +55,6 @@ typedef struct {
     uint16_t lhs;
     uint16_t rhs;
 } HEVMOperation;
-
 */
 import "C"
 
@@ -50,8 +65,10 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"runtime/cgo"
 	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/tuneinsight/lattigo/v6/circuits/ckks/bootstrapping"
@@ -62,7 +79,7 @@ import (
 const (
 	kMagicHEVM = uint32(0x4845564D)
 
-	// opcodes
+	// opcodes (match HEaaN backend)
 	OP_ENCODE   = 0
 	OP_ROTATEC  = 1
 	OP_NEGATEC  = 2
@@ -81,14 +98,14 @@ const (
 	ROLE_SERVER = 2
 )
 
+// -------------------- preset --------------------
+
 type defaultParametersLiteral struct {
 	CKKS ckks.ParametersLiteral
 	BOOT bootstrapping.ParametersLiteral
 }
 
-// ------------------------------------------------------------
-// ✅ Use official boot preset literals from Lattigo
-// ------------------------------------------------------------
+// Official Lattigo boot preset literals (v6.1.1)
 var N16QP1546H192H32 = defaultParametersLiteral{
 	CKKS: bootstrapping.N16QP1546H192H32.SchemeParams,
 	BOOT: bootstrapping.N16QP1546H192H32.BootstrappingParams,
@@ -98,111 +115,295 @@ func bootPreset() (name string, p defaultParametersLiteral) {
 	return "N16QP1546H192H32", N16QP1546H192H32
 }
 
+const contextGobName = "context.lattigo.gob"
+
+// -------------------- Context saved on disk --------------------
+
 type Context struct {
 	ParamName string
 	ParamsLit ckks.ParametersLiteral
 	BootLit   bootstrapping.ParametersLiteral
 
-	// Keys are generated UNDER BootstrappingParameters domain (the only VM domain).
+	// Keys are generated under BootstrappingParameters domain.
 	SK  rlwe.SecretKey
 	PK  rlwe.PublicKey
 	RLK rlwe.RelinearizationKey
 }
 
-type VM struct {
-	role int
+// -------------------- Handle helpers (C malloc + cgo.Handle) --------------------
 
-	// optional HEVM program
+// handlePtr layout: *(uintptr*)ptr == uintptr(cgo.Handle)
+func newHandlePtr(v any) unsafe.Pointer {
+	h := cgo.NewHandle(v)
+	p := C.malloc(C.size_t(unsafe.Sizeof(uintptr(0))))
+	*(*uintptr)(p) = uintptr(h)
+	return p
+}
+func loadHandlePtr(p unsafe.Pointer) (cgo.Handle, bool) {
+	if p == nil {
+		return cgo.Handle(0), false
+	}
+	u := *(*uintptr)(p)
+	if u == 0 {
+		return cgo.Handle(0), false
+	}
+	return cgo.Handle(u), true
+}
+func freeHandlePtr(p unsafe.Pointer) {
+	if p == nil {
+		return
+	}
+	u := *(*uintptr)(p)
+	if u != 0 {
+		cgo.Handle(u).Delete()
+	}
+	C.free(p)
+}
+
+// -------------------- HEVM (Lattigo) --------------------
+
+type LATTIGO_HEVM struct {
+	// data buffers
+	buffer [][]float64
+
+	// hevm file metadata
 	header C.HEVMHeader
 	config C.ConfigBody
 	ops    []C.HEVMOperation
 
-	constants [][]float64
+	arg_scale []uint64
+	arg_level []uint64
+	res_scale []uint64
+	res_level []uint64
+	res_dst   []uint64
 
-	argScale []uint64
-	argLevel []uint64
-	resScale []uint64
-	resLevel []uint64
-	resDst   []uint64
-
-	// --------------------
-	// CKKS core (ONLY domain): BootstrappingParameters
-	// --------------------
+	// ckks objects
 	paramName string
 
-	// Residual/scheme params only kept to (re)construct boot parameters if needed.
-	// All actual ops use `params` (BootstrappingParameters).
+	// residual/scheme params, and boot parameters (constructed from residual + boot literal)
 	residualParams ckks.Parameters
-	params         ckks.Parameters
-	slots          int
+	bootLit        bootstrapping.ParametersLiteral
+	bootParams     bootstrapping.Parameters
+
+	// ONLY domain for all ops:
+	params ckks.Parameters
+	slots  int
+
+	sk  *rlwe.SecretKey
+	pk  *rlwe.PublicKey
+	rlk *rlwe.RelinearizationKey
 
 	encoder   *ckks.Encoder
 	encryptor *rlwe.Encryptor
 	decryptor *rlwe.Decryptor
 	evaluator *ckks.Evaluator
 
-	sk  *rlwe.SecretKey
-	pk  *rlwe.PublicKey
-	rlk *rlwe.RelinearizationKey
+	// ciphertext/plain buffers
+	ciphers []rlwe.Ciphertext
+	scalec  []float64 // track log2(scale) for debug / decode hint
+	plains  []rlwe.Plaintext
+	scalep  []float64 // log2(scale) for pt buffer
+	levelp  []uint64
 
-	// lazy rotation keys
+	// preencode path
+	msgs      [][]float64
+	preencode bool
+
+	// lazy rotation keys (needs SK)
 	gksMu sync.Mutex
 	gkMap map[int]*rlwe.GaloisKey
 	gks   []*rlwe.GaloisKey
 
-	// boot
+	// bootstrapping
 	bootMu     sync.Mutex
 	bootInited bool
 	bootErr    error
-
-	bootLit    bootstrapping.ParametersLiteral
-	bootParams bootstrapping.Parameters
 	bootEVK    *bootstrapping.EvaluationKeys
 	bootEval   *bootstrapping.Evaluator
+	boot_time  uint64 // microseconds
+	boot_cnt   uint64
 
-	// buffers (standalone ops use these)
-	ciphers []rlwe.Ciphertext
-	plains  []rlwe.Plaintext
-
+	// flags
 	debug bool
-	toGPU bool
+	togpu bool // kept for ABI parity only
 }
 
-func getVM(h C.uintptr_t) *VM {
-	if h == 0 {
-		return nil
+// -------------------- VM creation / load (disk) --------------------
+
+func (v *LATTIGO_HEVM) setupFromPresetNewKeys() error {
+	name, preset := bootPreset()
+	v.paramName = name
+	v.bootLit = preset.BOOT
+
+	residual, err := ckks.NewParametersFromLiteral(preset.CKKS)
+	if err != nil {
+		return err
 	}
-	hd := cgo.Handle(h)
-	v, ok := hd.Value().(*VM)
-	if !ok {
-		return nil
+	btp, err := bootstrapping.NewParametersFromLiteral(residual, preset.BOOT)
+	if err != nil {
+		return err
 	}
-	return v
-}
-func getCtx(h C.uintptr_t) *Context {
-	if h == 0 {
-		return nil
-	}
-	hd := cgo.Handle(h)
-	cx, ok := hd.Value().(*Context)
-	if !ok {
-		return nil
-	}
-	return cx
+
+	vmParams := btp.BootstrappingParameters
+
+	v.residualParams = residual
+	v.bootParams = btp
+	v.params = vmParams
+	v.slots = v.params.MaxSlots()
+
+	const encPrec = uint(53)
+	v.encoder = ckks.NewEncoder(v.params, encPrec)
+
+	kgen := ckks.NewKeyGenerator(v.params)
+	v.sk, v.pk = kgen.GenKeyPairNew()
+	v.rlk = kgen.GenRelinearizationKeyNew(v.sk)
+
+	v.encryptor = ckks.NewEncryptor(v.params, v.pk)
+	v.decryptor = ckks.NewDecryptor(v.params, v.sk)
+
+	v.resetRotationCache()
+	evk := rlwe.NewMemEvaluationKeySet(v.rlk)
+	v.evaluator = ckks.NewEvaluator(v.params, evk)
+
+	v.ensureBuffers(64, 64)
+	v.ensureMsgBuffers(64)
+
+	// reset boot state
+	v.bootInited = false
+	v.bootErr = nil
+	v.bootEVK = nil
+	v.bootEval = nil
+	v.boot_time = 0
+	v.boot_cnt = 0
+	return nil
 }
 
-func (v *VM) resetRotationCache() {
+func (v *LATTIGO_HEVM) setupFromContext(cx *Context) error {
+	if cx == nil {
+		return fmt.Errorf("nil context")
+	}
+
+	residual, err := ckks.NewParametersFromLiteral(cx.ParamsLit)
+	if err != nil {
+		return err
+	}
+	btp, err := bootstrapping.NewParametersFromLiteral(residual, cx.BootLit)
+	if err != nil {
+		return err
+	}
+
+	vmParams := btp.BootstrappingParameters
+
+	v.paramName = cx.ParamName
+	v.bootLit = cx.BootLit
+
+	v.residualParams = residual
+	v.bootParams = btp
+	v.params = vmParams
+	v.slots = v.params.MaxSlots()
+
+	const encPrec = uint(53)
+	v.encoder = ckks.NewEncoder(v.params, encPrec)
+
+	// keys are under vmParams domain
+	v.sk = &cx.SK
+	v.pk = &cx.PK
+	v.rlk = &cx.RLK
+
+	v.encryptor = ckks.NewEncryptor(v.params, v.pk)
+	v.decryptor = ckks.NewDecryptor(v.params, v.sk)
+
+	v.resetRotationCache()
+	evk := rlwe.NewMemEvaluationKeySet(v.rlk)
+	v.evaluator = ckks.NewEvaluator(v.params, evk)
+
+	v.ensureBuffers(64, 64)
+	v.ensureMsgBuffers(64)
+
+	v.bootInited = false
+	v.bootErr = nil
+	v.bootEVK = nil
+	v.bootEval = nil
+	v.boot_time = 0
+	v.boot_cnt = 0
+	return nil
+}
+
+func (v *LATTIGO_HEVM) contextPath(dir string) string {
+	return filepath.Join(dir, contextGobName)
+}
+
+func (v *LATTIGO_HEVM) loadLattigo(dir string) error {
+	p := v.contextPath(dir)
+	f, err := os.Open(p)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	var cx Context
+	if err := gob.NewDecoder(f).Decode(&cx); err != nil {
+		return err
+	}
+	return v.setupFromContext(&cx)
+}
+
+// -------------------- buffers --------------------
+
+func (v *LATTIGO_HEVM) ensureBuffers(ctN, ptN int) {
+	if ctN < 1 {
+		ctN = 1
+	}
+	if ptN < 1 {
+		ptN = 1
+	}
+
+	if len(v.ciphers) < ctN {
+		old := len(v.ciphers)
+		v.ciphers = append(v.ciphers, make([]rlwe.Ciphertext, ctN-old)...)
+		v.scalec = append(v.scalec, make([]float64, ctN-old)...)
+		for i := old; i < ctN; i++ {
+			v.ciphers[i] = *ckks.NewCiphertext(v.params, 1, v.params.MaxLevel())
+			v.scalec[i] = float64(v.params.LogDefaultScale())
+		}
+	}
+
+	if len(v.plains) < ptN {
+		old := len(v.plains)
+		v.plains = append(v.plains, make([]rlwe.Plaintext, ptN-old)...)
+		v.scalep = append(v.scalep, make([]float64, ptN-old)...)
+		v.levelp = append(v.levelp, make([]uint64, ptN-old)...)
+		for i := old; i < ptN; i++ {
+			v.plains[i] = *ckks.NewPlaintext(v.params, v.params.MaxLevel())
+			v.scalep[i] = float64(v.params.LogDefaultScale())
+			v.levelp[i] = uint64(v.params.MaxLevel())
+		}
+	}
+}
+
+func (v *LATTIGO_HEVM) ensureMsgBuffers(n int) {
+	if n < 1 {
+		n = 1
+	}
+	if len(v.msgs) < n {
+		old := len(v.msgs)
+		v.msgs = append(v.msgs, make([][]float64, n-old)...)
+		for i := old; i < n; i++ {
+			v.msgs[i] = make([]float64, 0)
+		}
+	}
+}
+
+// -------------------- rotation keys --------------------
+
+func (v *LATTIGO_HEVM) resetRotationCache() {
 	v.gksMu.Lock()
 	defer v.gksMu.Unlock()
 	v.gkMap = make(map[int]*rlwe.GaloisKey)
 	v.gks = nil
 }
 
-// ---------------------------------------------------------------------
-// Defensive clamp: avoid Ring.AtLevel panic if underlying polys have extra levels.
-// (Should not happen anymore once params are unified, but keep it.)
-// ---------------------------------------------------------------------
-func (v *VM) clampCiphertextToMaxLevel(ct *rlwe.Ciphertext) {
+func (v *LATTIGO_HEVM) clampCiphertextToMaxLevel(ct *rlwe.Ciphertext) {
 	if ct == nil || v.params.LogN() == 0 {
 		return
 	}
@@ -214,7 +415,7 @@ func (v *VM) clampCiphertextToMaxLevel(ct *rlwe.Ciphertext) {
 	}
 }
 
-func (v *VM) ensureRotationKey(k int) {
+func (v *LATTIGO_HEVM) ensureRotationKey(k int) {
 	if k == 0 || v.sk == nil || v.params.LogN() == 0 {
 		return
 	}
@@ -249,136 +450,9 @@ func (v *VM) ensureRotationKey(k int) {
 	v.evaluator = ckks.NewEvaluator(v.params, evk)
 }
 
-// ------------------------------------------------------------
-// ✅ Core change: build residualParams + bootParams, then set v.params = BootstrappingParameters
-// and generate keys under v.params.
-// ------------------------------------------------------------
-func (v *VM) setupFromPresetNewKeys() error {
-	name, p := bootPreset()
-	v.paramName = name
-	v.bootLit = p.BOOT
+// -------------------- bootstrapping --------------------
 
-	// residual/scheme params
-	residual, err := ckks.NewParametersFromLiteral(p.CKKS)
-	if err != nil {
-		return err
-	}
-
-	// boot parameters from residual+boot literal
-	btpParams, err := bootstrapping.NewParametersFromLiteral(residual, p.BOOT)
-	if err != nil {
-		return err
-	}
-
-	// ONLY domain for VM ops
-	vmParams := btpParams.BootstrappingParameters
-
-	v.residualParams = residual
-	v.bootParams = btpParams
-	v.params = vmParams
-	v.slots = v.params.MaxSlots()
-
-	const encPrec = uint(53)
-	v.encoder = ckks.NewEncoder(v.params, encPrec)
-
-	kgen := ckks.NewKeyGenerator(v.params)
-	v.sk, v.pk = kgen.GenKeyPairNew()
-	v.rlk = kgen.GenRelinearizationKeyNew(v.sk)
-
-	v.encryptor = ckks.NewEncryptor(v.params, v.pk)
-	v.decryptor = ckks.NewDecryptor(v.params, v.sk)
-
-	v.resetRotationCache()
-	evk := rlwe.NewMemEvaluationKeySet(v.rlk)
-	v.evaluator = ckks.NewEvaluator(v.params, evk)
-
-	// standalone buffers default
-	v.ensureBuffers(64, 64)
-
-	// reset boot state (keys/evaluator are derived from current v.sk)
-	v.bootInited = false
-	v.bootErr = nil
-	v.bootEVK = nil
-	v.bootEval = nil
-
-	return nil
-}
-
-func (v *VM) setupFromContext(cx *Context) error {
-	if cx == nil {
-		return fmt.Errorf("nil context")
-	}
-
-	// residual/scheme params from stored literal
-	residual, err := ckks.NewParametersFromLiteral(cx.ParamsLit)
-	if err != nil {
-		return err
-	}
-
-	// boot params from residual+boot literal
-	btpParams, err := bootstrapping.NewParametersFromLiteral(residual, cx.BootLit)
-	if err != nil {
-		return err
-	}
-
-	vmParams := btpParams.BootstrappingParameters
-
-	v.paramName = cx.ParamName
-	v.bootLit = cx.BootLit
-
-	v.residualParams = residual
-	v.bootParams = btpParams
-	v.params = vmParams
-	v.slots = v.params.MaxSlots()
-
-	const encPrec = uint(53)
-	v.encoder = ckks.NewEncoder(v.params, encPrec)
-
-	// keys were generated under BootstrappingParameters domain
-	v.sk = &cx.SK
-	v.pk = &cx.PK
-	v.rlk = &cx.RLK
-
-	v.encryptor = ckks.NewEncryptor(v.params, v.pk)
-	v.decryptor = ckks.NewDecryptor(v.params, v.sk)
-
-	v.resetRotationCache()
-	evk := rlwe.NewMemEvaluationKeySet(v.rlk)
-	v.evaluator = ckks.NewEvaluator(v.params, evk)
-
-	v.ensureBuffers(64, 64)
-
-	v.bootInited = false
-	v.bootErr = nil
-	v.bootEVK = nil
-	v.bootEval = nil
-	return nil
-}
-
-func (v *VM) ensureBuffers(ctN, ptN int) {
-	if ctN < 1 {
-		ctN = 1
-	}
-	if ptN < 1 {
-		ptN = 1
-	}
-	if len(v.ciphers) < ctN {
-		old := len(v.ciphers)
-		v.ciphers = append(v.ciphers, make([]rlwe.Ciphertext, ctN-old)...)
-		for i := old; i < ctN; i++ {
-			v.ciphers[i] = *ckks.NewCiphertext(v.params, 1, v.params.MaxLevel())
-		}
-	}
-	if len(v.plains) < ptN {
-		old := len(v.plains)
-		v.plains = append(v.plains, make([]rlwe.Plaintext, ptN-old)...)
-		for i := old; i < ptN; i++ {
-			v.plains[i] = *ckks.NewPlaintext(v.params, v.params.MaxLevel())
-		}
-	}
-}
-
-func (v *VM) ensureBoot() error {
+func (v *LATTIGO_HEVM) ensureBoot() error {
 	v.bootMu.Lock()
 	defer v.bootMu.Unlock()
 
@@ -396,16 +470,13 @@ func (v *VM) ensureBoot() error {
 		return v.bootErr
 	}
 
-	// Always (re)build bootstrapping.Parameters from residualParams + bootLit.
-	// This avoids depending on internal struct field names (v6.1.1 has no SchemeParameters field).
-	btpParams, err := bootstrapping.NewParametersFromLiteral(v.residualParams, v.bootLit)
+	btp, err := bootstrapping.NewParametersFromLiteral(v.residualParams, v.bootLit)
 	if err != nil {
 		v.bootErr = fmt.Errorf("boot: NewParametersFromLiteral: %w", err)
 		return v.bootErr
 	}
-	v.bootParams = btpParams
+	v.bootParams = btp
 
-	// Generate boot keys under SAME SK (which is in BootstrappingParameters domain).
 	evk, _, err := v.bootParams.GenEvaluationKeys(v.sk)
 	if err != nil {
 		v.bootErr = fmt.Errorf("boot: GenEvaluationKeys: %w", err)
@@ -426,7 +497,49 @@ func (v *VM) ensureBoot() error {
 	return nil
 }
 
-// -------------------- binary helpers + program load (optional) --------------------
+// -------------------- constants bin (same layout as HEaaN backend) --------------------
+
+func (v *LATTIGO_HEVM) loadConstants(name string) error {
+	f, err := os.Open(name)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	var b8 [8]byte
+	if _, err := io.ReadFull(f, b8[:]); err != nil {
+		return err
+	}
+	n := int64(binary.LittleEndian.Uint64(b8[:]))
+	if n < 0 || n > 1_000_000 {
+		return fmt.Errorf("constants len invalid: %d", n)
+	}
+
+	out := make([][]float64, n)
+	for i := int64(0); i < n; i++ {
+		if _, err := io.ReadFull(f, b8[:]); err != nil {
+			return err
+		}
+		veclen := int64(binary.LittleEndian.Uint64(b8[:]))
+		if veclen < 0 || veclen > 1_000_000 {
+			return fmt.Errorf("constants veclen invalid: %d", veclen)
+		}
+		raw := make([]byte, veclen*8)
+		if _, err := io.ReadFull(f, raw); err != nil {
+			return err
+		}
+		vec := make([]float64, veclen)
+		for j := int64(0); j < veclen; j++ {
+			u := binary.LittleEndian.Uint64(raw[j*8 : j*8+8])
+			vec[j] = math.Float64frombits(u)
+		}
+		out[i] = vec
+	}
+	v.buffer = out
+	return nil
+}
+
+// -------------------- HEVM binary parsing --------------------
 
 func readU32(r io.Reader) (uint32, error) {
 	var b [4]byte
@@ -455,78 +568,20 @@ func readOp(r io.Reader) (C.HEVMOperation, error) {
 	}, nil
 }
 
-func readConstantsBin(path string) ([][]float64, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	var b8 [8]byte
-	if _, err := io.ReadFull(f, b8[:]); err != nil {
-		return nil, err
-	}
-	n := int64(binary.LittleEndian.Uint64(b8[:]))
-	if n < 0 || n > 1_000_000 {
-		return nil, fmt.Errorf("constants len invalid: %d", n)
-	}
-
-	out := make([][]float64, n)
-	for i := int64(0); i < n; i++ {
-		if _, err := io.ReadFull(f, b8[:]); err != nil {
-			return nil, err
-		}
-		veclen := int64(binary.LittleEndian.Uint64(b8[:]))
-		if veclen < 0 || veclen > 1_000_000 {
-			return nil, fmt.Errorf("constants veclen invalid: %d", veclen)
-		}
-		raw := make([]byte, veclen*8)
-		if _, err := io.ReadFull(f, raw); err != nil {
-			return nil, err
-		}
-		vec := make([]float64, veclen)
-		for j := int64(0); j < veclen; j++ {
-			u := binary.LittleEndian.Uint64(raw[j*8 : j*8+8])
-			vec[j] = math.Float64frombits(u)
-		}
-		out[i] = vec
-	}
-	return out, nil
-}
-
-func (v *VM) encodeToPlainAt(dst *rlwe.Plaintext, values []float64, level int, log2Scale int) {
-	pt := ckks.NewPlaintext(v.params, level)
-	pt.Scale = rlwe.NewScale(math.Exp2(float64(log2Scale)))
-	vec := make([]complex128, v.slots)
-	if len(values) > 0 {
-		for i := 0; i < v.slots; i++ {
-			vec[i] = complex(values[i%len(values)], 0)
-		}
-	}
-	v.encoder.Encode(vec, pt)
-	*dst = *pt
-}
-
-func (v *VM) loadHEVM(path string) error {
-	f, err := os.Open(path)
+func (v *LATTIGO_HEVM) loadHeader(r io.Reader) error {
+	magic, err := readU32(r)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-
-	magic, err := readU32(f)
+	hsize, err := readU32(r)
 	if err != nil {
 		return err
 	}
-	hsize, err := readU32(f)
+	argLen, err := readU64(r)
 	if err != nil {
 		return err
 	}
-	argLen, err := readU64(f)
-	if err != nil {
-		return err
-	}
-	resLen, err := readU64(f)
+	resLen, err := readU64(r)
 	if err != nil {
 		return err
 	}
@@ -540,27 +595,27 @@ func (v *VM) loadHEVM(path string) error {
 		return fmt.Errorf("bad magic: got 0x%x expect 0x%x", magic, kMagicHEVM)
 	}
 
-	cbl, err := readU64(f)
+	cbl, err := readU64(r)
 	if err != nil {
 		return err
 	}
-	numOps, err := readU64(f)
+	numOps, err := readU64(r)
 	if err != nil {
 		return err
 	}
-	numCtxt, err := readU64(f)
+	numCtxt, err := readU64(r)
 	if err != nil {
 		return err
 	}
-	numPtxt, err := readU64(f)
+	numPtxt, err := readU64(r)
 	if err != nil {
 		return err
 	}
-	initLvl, err := readU64(f)
+	initLvl, err := readU64(r)
 	if err != nil {
 		return err
 	}
-	reserved, err := readU64(f)
+	reserved, err := readU64(r)
 	if err != nil {
 		return err
 	}
@@ -575,15 +630,15 @@ func (v *VM) loadHEVM(path string) error {
 	aLen := int(argLen)
 	rLen := int(resLen)
 
-	v.argScale = make([]uint64, aLen)
-	v.argLevel = make([]uint64, aLen)
-	v.resScale = make([]uint64, rLen)
-	v.resLevel = make([]uint64, rLen)
-	v.resDst = make([]uint64, rLen)
+	v.arg_scale = make([]uint64, aLen)
+	v.arg_level = make([]uint64, aLen)
+	v.res_scale = make([]uint64, rLen)
+	v.res_level = make([]uint64, rLen)
+	v.res_dst = make([]uint64, rLen)
 
 	readArr := func(dst []uint64) error {
 		for i := range dst {
-			x, err := readU64(f)
+			x, err := readU64(r)
 			if err != nil {
 				return err
 			}
@@ -591,57 +646,548 @@ func (v *VM) loadHEVM(path string) error {
 		}
 		return nil
 	}
-	if err := readArr(v.argScale); err != nil {
+	if err := readArr(v.arg_scale); err != nil {
 		return err
 	}
-	if err := readArr(v.argLevel); err != nil {
+	if err := readArr(v.arg_level); err != nil {
 		return err
 	}
-	if err := readArr(v.resScale); err != nil {
+	if err := readArr(v.res_scale); err != nil {
 		return err
 	}
-	if err := readArr(v.resLevel); err != nil {
+	if err := readArr(v.res_level); err != nil {
 		return err
 	}
-	if err := readArr(v.resDst); err != nil {
+	if err := readArr(v.res_dst); err != nil {
 		return err
 	}
 
-	v.ops = make([]C.HEVMOperation, int(numOps))
-	for i := 0; i < int(numOps); i++ {
+	// Allocate buffers similarly to HEaaN backend:
+	// ciphers >= arg_len + res_len, plus any extra num_ctxt_buffer if present.
+	ctN := int(numCtxt)
+	ptN := int(numPtxt)
+	minCt := aLen + rLen
+	if ctN < minCt {
+		ctN = minCt
+	}
+	v.ensureBuffers(ctN, max(1, ptN))
+	v.ensureMsgBuffers(max(1, ptN))
+
+	// reset scales bookkeeping
+	for i := 0; i < len(v.scalec); i++ {
+		v.scalec[i] = float64(v.params.LogDefaultScale())
+	}
+	for i := 0; i < len(v.scalep); i++ {
+		v.scalep[i] = float64(v.params.LogDefaultScale())
+		v.levelp[i] = uint64(v.params.MaxLevel())
+	}
+	return nil
+}
+
+func (v *LATTIGO_HEVM) resetResDst() {
+	// Match HEaaN behavior: res_dst[i] = i + arg_length
+	aLen := int(v.header.config_header.arg_length)
+	for i := 0; i < int(v.header.config_header.res_length); i++ {
+		v.res_dst[i] = uint64(i + aLen)
+	}
+}
+
+func (v *LATTIGO_HEVM) loadHEVM(name string) error {
+	f, err := os.Open(name)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if err := v.loadHeader(f); err != nil {
+		return err
+	}
+
+	numOps := int(v.config.num_operations)
+	v.ops = make([]C.HEVMOperation, numOps)
+	for i := 0; i < numOps; i++ {
 		op, err := readOp(f)
 		if err != nil {
 			return err
 		}
 		v.ops[i] = op
 	}
-
-	ctN := int(numCtxt)
-	ptN := int(numPtxt)
-	if ctN < aLen+rLen {
-		ctN = aLen + rLen
-	}
-	v.ensureBuffers(ctN, ptN)
-
 	return nil
 }
 
-// -------------------- Ciphertext handle exchange (optional) --------------------
+// -------------------- encode path --------------------
+
+func (v *LATTIGO_HEVM) to_msg(dst int16, src []float64) {
+	v.ensureMsgBuffers(int(dst) + 1)
+	// store raw real values; encoding happens online.
+	cp := make([]float64, len(src))
+	copy(cp, src)
+	v.msgs[int(dst)] = cp
+}
+
+func (v *LATTIGO_HEVM) encode_online(dst int16) {
+	if len(v.plains) == 0 {
+		v.ensureBuffers(len(v.ciphers), 1)
+	}
+	if len(v.msgs) <= int(dst) {
+		return
+	}
+	level := int(v.levelp[int(dst)])
+	log2Scale := int(v.scalep[int(dst)])
+
+	if level > v.params.MaxLevel() {
+		level = v.params.MaxLevel()
+	}
+	if level < 0 {
+		level = v.params.MaxLevel()
+	}
+	if log2Scale <= 0 {
+		log2Scale = int(v.params.LogDefaultScale())
+	}
+
+	src := v.msgs[int(dst)]
+	pt := ckks.NewPlaintext(v.params, level)
+	pt.Scale = rlwe.NewScale(math.Exp2(float64(log2Scale)))
+
+	vec := make([]complex128, v.slots)
+	if len(src) > 0 {
+		for i := 0; i < v.slots; i++ {
+			vec[i] = complex(src[i%len(src)], 0)
+		}
+	}
+	v.encoder.Encode(vec, pt)
+	v.plains[0] = *pt
+}
+
+func (v *LATTIGO_HEVM) encode_internal(dst *rlwe.Plaintext, src []float64, level int, log2Scale int) {
+	if level > v.params.MaxLevel() {
+		level = v.params.MaxLevel()
+	}
+	if level < 0 {
+		level = v.params.MaxLevel()
+	}
+	if log2Scale <= 0 {
+		log2Scale = int(v.params.LogDefaultScale())
+	}
+
+	pt := ckks.NewPlaintext(v.params, level)
+	pt.Scale = rlwe.NewScale(math.Exp2(float64(log2Scale)))
+
+	vec := make([]complex128, v.slots)
+	if len(src) > 0 {
+		for i := 0; i < v.slots; i++ {
+			vec[i] = complex(src[i%len(src)], 0)
+		}
+	}
+	v.encoder.Encode(vec, pt)
+	*dst = *pt
+}
+
+func (v *LATTIGO_HEVM) preprocess() {
+	identity := []float64{1.0}
+
+	for i := range v.ops {
+		op := v.ops[i]
+		if int(op.opcode) != OP_ENCODE {
+			continue
+		}
+		dst := int16(op.dst)
+		lhs := int(op.lhs)
+		level := int(uint16(op.rhs) >> 10)
+		log2Scale := int(uint16(op.rhs) & 0x3FF)
+
+		var src []float64
+		if lhs == int(uint16(^uint16(0))) { // (unsigned short)-1 == 65535
+			src = identity
+		} else if lhs >= 0 && lhs < len(v.buffer) {
+			src = v.buffer[lhs]
+		} else {
+			src = nil
+		}
+
+		v.ensureBuffers(len(v.ciphers), int(dst)+1)
+		v.ensureMsgBuffers(int(dst) + 1)
+
+		v.levelp[int(dst)] = uint64(level)
+		v.scalep[int(dst)] = float64(log2Scale)
+
+		if v.preencode {
+			v.encode_internal(&v.plains[int(dst)], src, level, log2Scale)
+		} else {
+			v.to_msg(dst, src)
+		}
+	}
+}
+
+// -------------------- op handlers (match HEaaN method names) --------------------
+
+func (v *LATTIGO_HEVM) encode(dst, src int16, level int8, scale int8) {
+	// no-op: preprocess handles encoding (same spirit as HEaaN backend).
+	_ = dst
+	_ = src
+	_ = level
+	_ = scale
+}
+
+func (v *LATTIGO_HEVM) rotate(dst, src, offset int16) {
+	k := int(int16(offset))
+	if v.debug {
+		fmt.Printf("[rotate] scalec[%d]=%.0f k=%d level=%d\n", src, v.scalec[src], k, v.ciphers[src].Level())
+	}
+	v.clampCiphertextToMaxLevel(&v.ciphers[src])
+	v.ensureRotationKey(k)
+	_ = v.evaluator.Rotate(&v.ciphers[src], k, &v.ciphers[dst])
+	v.clampCiphertextToMaxLevel(&v.ciphers[dst])
+	v.scalec[dst] = v.scalec[src]
+}
+
+func (v *LATTIGO_HEVM) negate(dst, src int16) {
+	if v.debug {
+		fmt.Printf("[negate] scalec[%d]=%.0f level=%d\n", src, v.scalec[src], v.ciphers[src].Level())
+	}
+	v.clampCiphertextToMaxLevel(&v.ciphers[src])
+	// use Mul by scalar to avoid relying on optional Neg API
+	_ = v.evaluator.Mul(&v.ciphers[src], -1.0, &v.ciphers[dst])
+	v.clampCiphertextToMaxLevel(&v.ciphers[dst])
+	v.scalec[dst] = v.scalec[src]
+}
+
+func (v *LATTIGO_HEVM) rescale(dst, src int16) {
+	if v.debug {
+		fmt.Printf("[rescale] scalec[%d]=%.0f level=%d\n", src, v.scalec[src], v.ciphers[src].Level())
+	}
+	v.clampCiphertextToMaxLevel(&v.ciphers[src])
+	_ = v.evaluator.Rescale(&v.ciphers[src], &v.ciphers[dst])
+	v.clampCiphertextToMaxLevel(&v.ciphers[dst])
+	v.scalec[dst] = log2ScaleOf(&v.ciphers[dst], v.params.LogDefaultScale())
+}
+
+func (v *LATTIGO_HEVM) modswitch(dst, src, downFactor int16) {
+	df := int(downFactor)
+	if v.debug {
+		fmt.Printf("[modswitch] scalec[%d]=%.0f down=%d level=%d\n", src, v.scalec[src], df, v.ciphers[src].Level())
+	}
+	v.ciphers[dst] = v.ciphers[src]
+	v.clampCiphertextToMaxLevel(&v.ciphers[dst])
+	if df > 0 {
+		v.evaluator.DropLevel(&v.ciphers[dst], df)
+	}
+	v.clampCiphertextToMaxLevel(&v.ciphers[dst])
+	v.scalec[dst] = log2ScaleOf(&v.ciphers[dst], v.params.LogDefaultScale())
+}
+
+func (v *LATTIGO_HEVM) upscale(dst, src, upFactor int16) {
+	_ = dst
+	_ = src
+	_ = upFactor
+	fmt.Printf("[LATTIGO_HEVM][ERR] upscale: not supported\n")
+}
+
+func (v *LATTIGO_HEVM) addcc(dst, lhs, rhs int16) {
+	if v.debug {
+		fmt.Printf("[addcc] scalec[%d]=%.0f scalec[%d]=%.0f\n", lhs, v.scalec[lhs], rhs, v.scalec[rhs])
+	}
+
+	a := v.ciphers[lhs].CopyNew()
+	b := v.ciphers[rhs].CopyNew()
+	v.clampCiphertextToMaxLevel(a)
+	v.clampCiphertextToMaxLevel(b)
+
+	minL := a.Level()
+	if b.Level() < minL {
+		minL = b.Level()
+	}
+	if a.Level() > minL {
+		v.evaluator.DropLevel(a, a.Level()-minL)
+	}
+	if b.Level() > minL {
+		v.evaluator.DropLevel(b, b.Level()-minL)
+	}
+	// align scale
+	b.Scale = a.Scale
+
+	tmp := ckks.NewCiphertext(v.params, 1, minL)
+	tmp.Scale = a.Scale
+	_ = v.evaluator.Add(a, b, tmp)
+
+	v.clampCiphertextToMaxLevel(tmp)
+	v.ciphers[dst] = *tmp
+	v.scalec[dst] = log2ScaleOf(&v.ciphers[dst], v.params.LogDefaultScale())
+}
+
+func (v *LATTIGO_HEVM) addcp(dst, lhs, rhs int16) {
+	if v.debug {
+		fmt.Printf("[addcp] scalec[%d]=%.0f scalep[%d]=%.0f\n", lhs, v.scalec[lhs], rhs, v.scalep[rhs])
+	}
+
+	if v.preencode {
+		// plains[rhs]
+		pt := &v.plains[rhs]
+		a := v.ciphers[lhs].CopyNew()
+		v.clampCiphertextToMaxLevel(a)
+		if a.Level() > pt.Level() {
+			v.evaluator.DropLevel(a, a.Level()-pt.Level())
+		}
+
+		tmp := ckks.NewCiphertext(v.params, 1, a.Level())
+		tmp.Scale = a.Scale
+		_ = v.evaluator.Add(a, pt, tmp)
+
+		v.clampCiphertextToMaxLevel(tmp)
+		v.ciphers[dst] = *tmp
+		v.scalec[dst] = log2ScaleOf(&v.ciphers[dst], v.params.LogDefaultScale())
+		return
+	}
+
+	// online encode into plains[0]
+	v.encode_online(rhs)
+	pt := &v.plains[0]
+
+	a := v.ciphers[lhs].CopyNew()
+	v.clampCiphertextToMaxLevel(a)
+	if a.Level() > pt.Level() {
+		v.evaluator.DropLevel(a, a.Level()-pt.Level())
+	}
+
+	tmp := ckks.NewCiphertext(v.params, 1, a.Level())
+	tmp.Scale = a.Scale
+	_ = v.evaluator.Add(a, pt, tmp)
+
+	v.clampCiphertextToMaxLevel(tmp)
+	v.ciphers[dst] = *tmp
+	v.scalec[dst] = log2ScaleOf(&v.ciphers[dst], v.params.LogDefaultScale())
+}
+
+func (v *LATTIGO_HEVM) mulcc(dst, lhs, rhs int16) {
+	if v.debug {
+		fmt.Printf("[mulcc] scalec[%d]=%.0f scalec[%d]=%.0f\n", lhs, v.scalec[lhs], rhs, v.scalec[rhs])
+	}
+
+	a := v.ciphers[lhs].CopyNew()
+	b := v.ciphers[rhs].CopyNew()
+	v.clampCiphertextToMaxLevel(a)
+	v.clampCiphertextToMaxLevel(b)
+
+	minL := a.Level()
+	if b.Level() < minL {
+		minL = b.Level()
+	}
+	if a.Level() > minL {
+		v.evaluator.DropLevel(a, a.Level()-minL)
+	}
+	if b.Level() > minL {
+		v.evaluator.DropLevel(b, b.Level()-minL)
+	}
+
+	tmp := ckks.NewCiphertext(v.params, 1, minL)
+	_ = v.evaluator.MulRelin(a, b, tmp) // "without rescale" semantics: rescale is a separate op
+
+	v.clampCiphertextToMaxLevel(tmp)
+	v.ciphers[dst] = *tmp
+	v.scalec[dst] = log2ScaleOf(&v.ciphers[dst], v.params.LogDefaultScale())
+}
+
+func (v *LATTIGO_HEVM) mulcp(dst, lhs, rhs int16) {
+	if v.debug {
+		fmt.Printf("[mulcp] scalec[%d]=%.0f scalep[%d]=%.0f ctLevel=%d ptLevel=%d\n",
+			lhs, v.scalec[lhs], rhs, v.scalep[rhs], v.ciphers[lhs].Level(), v.levelp[rhs])
+	}
+
+	if v.preencode {
+		v.clampCiphertextToMaxLevel(&v.ciphers[lhs])
+		_ = v.evaluator.Mul(&v.ciphers[lhs], &v.plains[rhs], &v.ciphers[dst])
+		v.clampCiphertextToMaxLevel(&v.ciphers[dst])
+		v.scalec[dst] = log2ScaleOf(&v.ciphers[dst], v.params.LogDefaultScale())
+		return
+	}
+
+	v.encode_online(rhs)
+	v.clampCiphertextToMaxLevel(&v.ciphers[lhs])
+	_ = v.evaluator.Mul(&v.ciphers[lhs], &v.plains[0], &v.ciphers[dst])
+	v.clampCiphertextToMaxLevel(&v.ciphers[dst])
+	v.scalec[dst] = log2ScaleOf(&v.ciphers[dst], v.params.LogDefaultScale())
+}
+
+func (v *LATTIGO_HEVM) bootstrap(dst int16, src int64, targetLevel uint64) {
+	s := int(src)
+	if v.debug {
+		fmt.Printf("[bootstrap] scalec[%d]=%.0f level=%d target=%d\n", s, v.scalec[s], v.ciphers[s].Level(), targetLevel)
+	}
+
+	v.clampCiphertextToMaxLevel(&v.ciphers[s])
+
+	if err := v.ensureBoot(); err != nil {
+		fmt.Printf("[LATTIGO_HEVM][BOOT][ERR] %v\n", err)
+		return
+	}
+
+	t0 := time.Now()
+	booted, err := v.bootEval.Bootstrap(&v.ciphers[s])
+	if err != nil {
+		fmt.Printf("[LATTIGO_HEVM][BOOT][ERR] Bootstrap: %v\n", err)
+		return
+	}
+	dur := time.Since(t0)
+	v.boot_time += uint64(dur / time.Microsecond)
+	v.boot_cnt++
+
+	v.clampCiphertextToMaxLevel(booted)
+	v.ciphers[int(dst)] = *booted
+
+	// optional target level drop
+	if int(targetLevel) >= 0 && int(targetLevel) <= v.params.MaxLevel() {
+		if v.ciphers[int(dst)].Level() > int(targetLevel) {
+			v.evaluator.DropLevel(&v.ciphers[int(dst)], v.ciphers[int(dst)].Level()-int(targetLevel))
+		}
+	}
+	v.clampCiphertextToMaxLevel(&v.ciphers[int(dst)])
+	v.scalec[int(dst)] = log2ScaleOf(&v.ciphers[int(dst)], v.params.LogDefaultScale())
+}
+
+// -------------------- run dispatcher --------------------
+
+func (v *LATTIGO_HEVM) run() {
+	iword := int((uint64(v.header.hevm_header_size) + uint64(v.config.config_body_length)) / 8)
+	jop := 0
+
+	for idx := range v.ops {
+		op := v.ops[idx]
+
+		if v.debug {
+			fmt.Printf("\n%o %d\n", iword, jop)
+			fmt.Printf("opcode [%d], dst [%d], lhs [%d], rhs [%d]\n", op.opcode, op.dst, op.lhs, op.rhs)
+			iword++
+			jop++
+		}
+
+		switch int(op.opcode) {
+		case OP_ENCODE:
+			v.encode(int16(op.dst), int16(op.lhs), int8(op.rhs>>10), int8(op.rhs&0x3FF))
+
+		case OP_ROTATEC:
+			v.rotate(int16(op.dst), int16(op.lhs), int16(op.rhs))
+
+		case OP_NEGATEC:
+			v.negate(int16(op.dst), int16(op.lhs))
+
+		case OP_RESCALEC:
+			v.rescale(int16(op.dst), int16(op.lhs))
+
+		case OP_MODSWC:
+			v.modswitch(int16(op.dst), int16(op.lhs), int16(op.rhs))
+
+		case OP_UPSCALEC:
+			v.upscale(int16(op.dst), int16(op.lhs), int16(op.rhs))
+
+		case OP_ADDCC:
+			v.addcc(int16(op.dst), int16(op.lhs), int16(op.rhs))
+
+		case OP_ADDCP:
+			v.addcp(int16(op.dst), int16(op.lhs), int16(op.rhs))
+
+		case OP_MULCC:
+			v.mulcc(int16(op.dst), int16(op.lhs), int16(op.rhs))
+
+		case OP_MULCP:
+			v.mulcp(int16(op.dst), int16(op.lhs), int16(op.rhs))
+
+		case OP_BOOT:
+			v.bootstrap(int16(op.dst), int64(op.lhs), uint64(op.rhs))
+
+		default:
+			// ignore
+		}
+	}
+}
+
+// -------------------- encrypt/decrypt (match HEaaN exported ABI names) --------------------
+
+func (v *LATTIGO_HEVM) encrypt(i int64, dat *C.double, length int) {
+	if dat == nil || length <= 0 {
+		return
+	}
+	id := int(i)
+	if id < 0 {
+		return
+	}
+	v.ensureBuffers(id+1, len(v.plains))
+	if v.encoder == nil || v.encryptor == nil {
+		_ = v.setupFromPresetNewKeys()
+	}
+
+	level := v.params.MaxLevel()
+	log2Scale := int(v.params.LogDefaultScale())
+	if id < len(v.arg_level) {
+		if int(v.arg_level[id]) <= v.params.MaxLevel() {
+			level = int(v.arg_level[id])
+		}
+	}
+	if id < len(v.arg_scale) {
+		if v.arg_scale[id] > 0 {
+			log2Scale = int(v.arg_scale[id])
+		}
+	}
+
+	src := (*[1 << 30]C.double)(unsafe.Pointer(dat))[:length:length]
+	vals := make([]float64, length)
+	for k := 0; k < length; k++ {
+		vals[k] = float64(src[k])
+	}
+
+	var pt rlwe.Plaintext
+	v.encode_internal(&pt, vals, level, log2Scale)
+
+	ct := ckks.NewCiphertext(v.params, 1, level)
+	v.encryptor.Encrypt(&pt, ct)
+
+	v.clampCiphertextToMaxLevel(ct)
+	v.ciphers[id] = *ct
+	v.scalec[id] = log2ScaleOf(&v.ciphers[id], v.params.LogDefaultScale())
+}
+
+func (v *LATTIGO_HEVM) decrypt(i int64, dat *C.double) {
+	if dat == nil {
+		return
+	}
+	id := int(i)
+	if id < 0 || id >= len(v.ciphers) || v.decryptor == nil || v.encoder == nil {
+		return
+	}
+
+	v.clampCiphertextToMaxLevel(&v.ciphers[id])
+
+	pt := ckks.NewPlaintext(v.params, v.ciphers[id].Level())
+	v.decryptor.Decrypt(&v.ciphers[id], pt)
+
+	// decode at ciphertext scale
+	pt.Scale = v.ciphers[id].Scale
+
+	vec := make([]complex128, v.slots)
+	v.encoder.Decode(pt, vec)
+
+	out := (*[1 << 30]C.double)(unsafe.Pointer(dat))[:v.slots:v.slots]
+	for k := 0; k < v.slots; k++ {
+		out[k] = C.double(real(vec[k]))
+	}
+}
+
+// -------------------- Ctxt handle exchange (communication) --------------------
 
 type CtxtBox struct{ CT rlwe.Ciphertext }
 
-func exportCiphertextHandle(ct *rlwe.Ciphertext) C.uintptr_t {
+func exportCiphertextHandle(ct *rlwe.Ciphertext) unsafe.Pointer {
 	if ct == nil {
-		return 0
-	}
-	box := &CtxtBox{CT: *ct}
-	return C.uintptr_t(cgo.NewHandle(box))
-}
-func importCiphertextHandle(h C.uintptr_t) *rlwe.Ciphertext {
-	if h == 0 {
 		return nil
 	}
-	hd := cgo.Handle(h)
+	box := &CtxtBox{CT: *ct} // copy
+	return newHandlePtr(box)
+}
+
+func importCiphertextHandle(p unsafe.Pointer) *rlwe.Ciphertext {
+	hd, ok := loadHandlePtr(p)
+	if !ok {
+		return nil
+	}
 	box, ok := hd.Value().(*CtxtBox)
 	if !ok || box == nil {
 		return nil
@@ -649,66 +1195,85 @@ func importCiphertextHandle(h C.uintptr_t) *rlwe.Ciphertext {
 	return &box.CT
 }
 
-// -------------------- Exported C ABI --------------------
+// -------------------- exported C ABI (names match HEaaN backend) --------------------
 
 //export initFullVM
-func initFullVM(path *C.char, useGPU C._Bool) C.uintptr_t {
-	_ = C.GoString(path)
-	vm := &VM{role: ROLE_FULL, debug: false, toGPU: bool(useGPU)}
-	_ = vm.setupFromPresetNewKeys()
-	h := cgo.NewHandle(vm)
-	fmt.Printf("[LATTIGO_HEVM] initFullVM useGPU=%v handle=%d\n", bool(useGPU), uintptr(h))
-	return C.uintptr_t(h)
+func initFullVM(dir *C.char, device C._Bool) unsafe.Pointer {
+	strdir := C.GoString(dir)
+	vm := &LATTIGO_HEVM{
+		debug: false,
+		togpu: bool(device),
+	}
+	// Try loading context from dir; fallback to new keys.
+	if strdir != "" {
+		if err := vm.loadLattigo(strdir); err != nil {
+			_ = vm.setupFromPresetNewKeys()
+		}
+	} else {
+		_ = vm.setupFromPresetNewKeys()
+	}
+	fmt.Printf("[LATTIGO_HEVM] initFullVM dir=%q device=%v\n", strdir, bool(device))
+	return newHandlePtr(vm)
 }
 
 //export initClientVM
-func initClientVM(path *C.char) C.uintptr_t {
-	_ = C.GoString(path)
-	vm := &VM{role: ROLE_CLIENT, debug: false}
-	h := cgo.NewHandle(vm)
-	fmt.Printf("[LATTIGO_HEVM] initClientVM handle=%d\n", uintptr(h))
-	return C.uintptr_t(h)
+func initClientVM(dir *C.char) unsafe.Pointer {
+	strdir := C.GoString(dir)
+	vm := &LATTIGO_HEVM{debug: false, togpu: false}
+	if strdir != "" {
+		if err := vm.loadLattigo(strdir); err != nil {
+			_ = vm.setupFromPresetNewKeys()
+		}
+	} else {
+		_ = vm.setupFromPresetNewKeys()
+	}
+	fmt.Printf("[LATTIGO_HEVM] initClientVM dir=%q\n", strdir)
+	return newHandlePtr(vm)
 }
 
 //export initServerVM
-func initServerVM(path *C.char) C.uintptr_t {
-	_ = C.GoString(path)
-	vm := &VM{role: ROLE_SERVER, debug: false}
-	h := cgo.NewHandle(vm)
-	fmt.Printf("[LATTIGO_HEVM] initServerVM handle=%d\n", uintptr(h))
-	return C.uintptr_t(h)
+func initServerVM(dir *C.char) unsafe.Pointer {
+	strdir := C.GoString(dir)
+	vm := &LATTIGO_HEVM{debug: false, togpu: true}
+	if strdir != "" {
+		if err := vm.loadLattigo(strdir); err != nil {
+			_ = vm.setupFromPresetNewKeys()
+		}
+	} else {
+		_ = vm.setupFromPresetNewKeys()
+	}
+	fmt.Printf("[LATTIGO_HEVM] initServerVM dir=%q\n", strdir)
+	return newHandlePtr(vm)
 }
 
 //export freeVM
-func freeVM(h C.uintptr_t) {
-	if h == 0 {
-		return
-	}
-	cgo.Handle(h).Delete()
+func freeVM(vm unsafe.Pointer) {
+	freeHandlePtr(vm)
 }
 
 //export create_context
-func create_context(path *C.char) C.uintptr_t {
-	p := C.GoString(path)
+func create_context(dir *C.char) {
+	strdir := C.GoString(dir)
+	if strdir == "" {
+		fmt.Printf("[LATTIGO_HEVM][ERR] create_context: empty dir\n")
+		return
+	}
+	_ = os.MkdirAll(strdir, 0o755)
 
 	name, preset := bootPreset()
 
-	// residual params (scheme)
 	residual, err := ckks.NewParametersFromLiteral(preset.CKKS)
 	if err != nil {
 		fmt.Printf("[LATTIGO_HEVM][ERR] create_context residual params: %v\n", err)
-		return 0
+		return
 	}
-
-	// boot params -> BootstrappingParameters domain
-	btpParams, err := bootstrapping.NewParametersFromLiteral(residual, preset.BOOT)
+	btp, err := bootstrapping.NewParametersFromLiteral(residual, preset.BOOT)
 	if err != nil {
 		fmt.Printf("[LATTIGO_HEVM][ERR] create_context boot params: %v\n", err)
-		return 0
+		return
 	}
-	vmParams := btpParams.BootstrappingParameters
+	vmParams := btp.BootstrappingParameters
 
-	// keys MUST be under vmParams domain
 	kgen := ckks.NewKeyGenerator(vmParams)
 	sk, pk := kgen.GenKeyPairNew()
 	rlk := kgen.GenRelinearizationKeyNew(sk)
@@ -722,766 +1287,308 @@ func create_context(path *C.char) C.uintptr_t {
 		RLK:       *rlk,
 	}
 
-	if p != "" {
-		if f, err := os.Create(p); err == nil {
-			enc := gob.NewEncoder(f)
-			if e := enc.Encode(cx); e != nil {
-				fmt.Printf("[LATTIGO_HEVM][ERR] create_context encode: %v\n", e)
-			}
-			_ = f.Close()
-		} else {
-			fmt.Printf("[LATTIGO_HEVM][ERR] create_context create file: %v\n", err)
-		}
-	}
-
-	h := cgo.NewHandle(cx)
-	fmt.Printf("[LATTIGO_HEVM] create_context preset=%s path=%q handle=%d\n", name, p, uintptr(h))
-	return C.uintptr_t(h)
-}
-
-//export freeContext
-func freeContext(h C.uintptr_t) {
-	if h == 0 {
+	p := filepath.Join(strdir, contextGobName)
+	f, err := os.Create(p)
+	if err != nil {
+		fmt.Printf("[LATTIGO_HEVM][ERR] create_context create file: %v\n", err)
 		return
 	}
-	cgo.Handle(h).Delete()
-}
+	defer f.Close()
 
-//export loadClient
-func loadClient(vmH C.uintptr_t, ctxH C.uintptr_t) {
-	v := getVM(vmH)
-	cx := getCtx(ctxH)
-	if v == nil || cx == nil {
+	if err := gob.NewEncoder(f).Encode(cx); err != nil {
+		fmt.Printf("[LATTIGO_HEVM][ERR] create_context encode: %v\n", err)
 		return
 	}
-	fmt.Printf("[LATTIGO_HEVM] loadClient vm=%d ctx=%d role=%d preset=%s\n",
-		uintptr(vmH), uintptr(ctxH), v.role, cx.ParamName)
 
-	if err := v.setupFromContext(cx); err != nil {
-		fmt.Printf("[LATTIGO_HEVM][ERR] loadClient setup: %v\n", err)
-		return
-	}
+	fmt.Printf("[LATTIGO_HEVM] create_context preset=%s dir=%q saved=%q\n", name, strdir, p)
 }
 
 //export load
-func load(h C.uintptr_t, constPath *C.char, hevmPath *C.char) {
-	v := getVM(h)
-	if v == nil {
+func load(vm unsafe.Pointer, constant *C.char, vmfile *C.char) {
+	hd, ok := loadHandlePtr(vm)
+	if !ok {
 		return
 	}
-	cpath := C.GoString(constPath)
-	hpath := C.GoString(hevmPath)
-	fmt.Printf("[LATTIGO_HEVM] load handle=%d const=%q hevm=%q\n", uintptr(h), cpath, hpath)
-
-	consts, err := readConstantsBin(cpath)
-	if err != nil {
-		fmt.Printf("[LATTIGO_HEVM][ERR] read constants: %v\n", err)
-		return
-	}
-	v.constants = consts
-
-	// FULL path: new keys/params (BootstrappingParameters domain)
-	if err := v.setupFromPresetNewKeys(); err != nil {
-		fmt.Printf("[LATTIGO_HEVM][ERR] setup CKKS(preset): %v\n", err)
+	hevm, ok := hd.Value().(*LATTIGO_HEVM)
+	if !ok || hevm == nil {
 		return
 	}
 
-	if err := v.loadHEVM(hpath); err != nil {
-		fmt.Printf("[LATTIGO_HEVM][ERR] read hevm: %v\n", err)
+	cpath := C.GoString(constant)
+	hpath := C.GoString(vmfile)
+	fmt.Printf("[LATTIGO_HEVM] load const=%q hevm=%q\n", cpath, hpath)
+
+	if cpath != "" {
+		if err := hevm.loadConstants(cpath); err != nil {
+			fmt.Printf("[LATTIGO_HEVM][ERR] loadConstants: %v\n", err)
+			return
+		}
+	}
+	if hevm.encoder == nil || hevm.evaluator == nil || hevm.params.LogN() == 0 {
+		_ = hevm.setupFromPresetNewKeys()
+	}
+	if err := hevm.loadHEVM(hpath); err != nil {
+		fmt.Printf("[LATTIGO_HEVM][ERR] loadHEVM: %v\n", err)
 		return
 	}
 
 	fmt.Printf("[LATTIGO_HEVM] preset=%s logN=%d slots=%d maxLevel=%d logScale=%d\n",
-		v.paramName, v.params.LogN(), v.slots, v.params.MaxLevel(), int(v.params.LogDefaultScale()))
+		hevm.paramName, hevm.params.LogN(), hevm.slots, hevm.params.MaxLevel(), int(hevm.params.LogDefaultScale()))
 }
 
-//export loadProgram
-func loadProgram(h C.uintptr_t, constPath *C.char, hevmPath *C.char) {
-	v := getVM(h)
-	if v == nil {
+//export loadClient
+func loadClient(vm unsafe.Pointer, is unsafe.Pointer) {
+	// HEaaN: loads header from std::istream and resets res_dst.
+	// Here: if is != NULL treat it as (char*) path to a .hevm file and load ONLY header arrays, then resetResDst.
+	hd, ok := loadHandlePtr(vm)
+	if !ok {
 		return
 	}
-	cpath := C.GoString(constPath)
-	hpath := C.GoString(hevmPath)
-	fmt.Printf("[LATTIGO_HEVM] loadProgram handle=%d const=%q hevm=%q\n", uintptr(h), cpath, hpath)
+	hevm, ok := hd.Value().(*LATTIGO_HEVM)
+	if !ok || hevm == nil {
+		return
+	}
+	if is == nil {
+		return
+	}
 
-	consts, err := readConstantsBin(cpath)
+	path := C.GoString((*C.char)(is))
+	if path == "" {
+		return
+	}
+	if hevm.encoder == nil || hevm.evaluator == nil || hevm.params.LogN() == 0 {
+		_ = hevm.setupFromPresetNewKeys()
+	}
+
+	f, err := os.Open(path)
 	if err != nil {
-		fmt.Printf("[LATTIGO_HEVM][ERR] read constants: %v\n", err)
+		fmt.Printf("[LATTIGO_HEVM][ERR] loadClient open: %v\n", err)
 		return
 	}
-	v.constants = consts
+	defer f.Close()
 
-	if (v.encoder == nil) || (v.evaluator == nil) || (v.params.LogN() == 0) {
-		fmt.Printf("[LATTIGO_HEVM][ERR] loadProgram: call loadClient() first\n")
+	if err := hevm.loadHeader(f); err != nil {
+		fmt.Printf("[LATTIGO_HEVM][ERR] loadClient loadHeader: %v\n", err)
 		return
 	}
+	hevm.resetResDst()
+	fmt.Printf("[LATTIGO_HEVM] loadClient header-only from %q (argLen=%d resLen=%d)\n",
+		path, hevm.header.config_header.arg_length, hevm.header.config_header.res_length)
+}
 
-	if err := v.loadHEVM(hpath); err != nil {
-		fmt.Printf("[LATTIGO_HEVM][ERR] read hevm: %v\n", err)
+//export encrypt
+func encrypt(vm unsafe.Pointer, i C.int64_t, dat *C.double, length C.int) {
+	hd, ok := loadHandlePtr(vm)
+	if !ok {
 		return
 	}
-
-	v.resetRotationCache()
-	evk := rlwe.NewMemEvaluationKeySet(v.rlk)
-	v.evaluator = ckks.NewEvaluator(v.params, evk)
-
-	fmt.Printf("[LATTIGO_HEVM] preset=%s logN=%d slots=%d maxLevel=%d logScale=%d\n",
-		v.paramName, v.params.LogN(), v.slots, v.params.MaxLevel(), int(v.params.LogDefaultScale()))
-}
-
-//export preprocess
-func preprocess(h C.uintptr_t) {
-	v := getVM(h)
-	if v == nil {
+	hevm, ok := hd.Value().(*LATTIGO_HEVM)
+	if !ok || hevm == nil {
 		return
 	}
-	fmt.Printf("[LATTIGO_HEVM] preprocess handle=%d\n", uintptr(h))
-
-	for _, op := range v.ops {
-		if int(op.opcode) != OP_ENCODE {
-			continue
-		}
-		dst := int(op.dst)
-		lhs := int(op.lhs)
-		level := int(uint16(op.rhs) >> 10)
-		log2Scale := int(uint16(op.rhs) & 0x3FF)
-
-		if dst < 0 || dst >= len(v.plains) {
-			continue
-		}
-
-		var src []float64
-		if lhs == 65535 {
-			src = []float64{1.0}
-		} else if lhs >= 0 && lhs < len(v.constants) {
-			src = v.constants[lhs]
-		} else {
-			src = nil
-		}
-
-		if level > v.params.MaxLevel() {
-			level = v.params.MaxLevel()
-		}
-		v.encodeToPlainAt(&v.plains[dst], src, level, log2Scale)
-	}
+	hevm.encrypt(int64(i), dat, int(length))
 }
 
-//export run
-func run(h C.uintptr_t) {
-	v := getVM(h)
-	if v == nil {
+//export decrypt
+func decrypt(vm unsafe.Pointer, i C.int64_t, dat *C.double) {
+	hd, ok := loadHandlePtr(vm)
+	if !ok {
 		return
 	}
-	fmt.Printf("[LATTIGO_HEVM] run handle=%d\n", uintptr(h))
-
-	ctAt := func(i int) *rlwe.Ciphertext {
-		if i < 0 || i >= len(v.ciphers) {
-			return nil
-		}
-		return &v.ciphers[i]
-	}
-	ptAt := func(i int) *rlwe.Plaintext {
-		if i < 0 || i >= len(v.plains) {
-			return nil
-		}
-		return &v.plains[i]
-	}
-
-	for _, op := range v.ops {
-		switch int(op.opcode) {
-		case OP_ENCODE:
-			continue
-
-		case OP_ROTATEC:
-			dst := int(op.dst)
-			src := int(op.lhs)
-			k := int(int16(op.rhs))
-			in, out := ctAt(src), ctAt(dst)
-			if in == nil || out == nil {
-				continue
-			}
-			v.clampCiphertextToMaxLevel(in)
-			v.ensureRotationKey(k)
-			_ = v.evaluator.Rotate(in, k, out)
-			v.clampCiphertextToMaxLevel(out)
-
-		case OP_NEGATEC:
-			dst := int(op.dst)
-			src := int(op.lhs)
-			in, out := ctAt(src), ctAt(dst)
-			if in == nil || out == nil {
-				continue
-			}
-			v.clampCiphertextToMaxLevel(in)
-			// Mul by scalar: use Mul(ct, -1.0, out) (available in ckks evaluator)
-			_ = v.evaluator.Mul(in, -1.0, out)
-			v.clampCiphertextToMaxLevel(out)
-
-		case OP_RESCALEC:
-			dst := int(op.dst)
-			src := int(op.lhs)
-			in, out := ctAt(src), ctAt(dst)
-			if in == nil || out == nil {
-				continue
-			}
-			v.clampCiphertextToMaxLevel(in)
-			_ = v.evaluator.Rescale(in, out)
-			v.clampCiphertextToMaxLevel(out)
-
-		case OP_MODSWC:
-			dst := int(op.dst)
-			src := int(op.lhs)
-			down := int(op.rhs)
-			in, out := ctAt(src), ctAt(dst)
-			if in == nil || out == nil {
-				continue
-			}
-			*out = *in
-			v.clampCiphertextToMaxLevel(out)
-			if down > 0 {
-				v.evaluator.DropLevel(out, down)
-			}
-			v.clampCiphertextToMaxLevel(out)
-
-		case OP_ADDCC:
-			dst := int(op.dst)
-			l := int(op.lhs)
-			r := int(op.rhs)
-			in0, in1, out := ctAt(l), ctAt(r), ctAt(dst)
-			if in0 == nil || in1 == nil || out == nil {
-				continue
-			}
-
-			a := in0.CopyNew()
-			b := in1.CopyNew()
-			v.clampCiphertextToMaxLevel(a)
-			v.clampCiphertextToMaxLevel(b)
-
-			minL := a.Level()
-			if b.Level() < minL {
-				minL = b.Level()
-			}
-			if a.Level() > minL {
-				v.evaluator.DropLevel(a, a.Level()-minL)
-			}
-			if b.Level() > minL {
-				v.evaluator.DropLevel(b, b.Level()-minL)
-			}
-			b.Scale = a.Scale
-
-			tmp := ckks.NewCiphertext(v.params, 1, minL)
-			tmp.Scale = a.Scale
-			_ = v.evaluator.Add(a, b, tmp)
-			v.clampCiphertextToMaxLevel(tmp)
-			*out = *tmp
-
-		case OP_ADDCP:
-			dst := int(op.dst)
-			l := int(op.lhs)
-			p := int(op.rhs)
-			in0, pt, out := ctAt(l), ptAt(p), ctAt(dst)
-			if in0 == nil || pt == nil || out == nil {
-				continue
-			}
-
-			a := in0.CopyNew()
-			v.clampCiphertextToMaxLevel(a)
-			if a.Level() > pt.Level() {
-				v.evaluator.DropLevel(a, a.Level()-pt.Level())
-			}
-
-			tmp := ckks.NewCiphertext(v.params, 1, a.Level())
-			tmp.Scale = a.Scale
-			_ = v.evaluator.Add(a, pt, tmp)
-			v.clampCiphertextToMaxLevel(tmp)
-			*out = *tmp
-
-		case OP_MULCC:
-			dst := int(op.dst)
-			l := int(op.lhs)
-			r := int(op.rhs)
-			in0, in1, out := ctAt(l), ctAt(r), ctAt(dst)
-			if in0 == nil || in1 == nil || out == nil {
-				continue
-			}
-
-			a := in0.CopyNew()
-			b := in1.CopyNew()
-			v.clampCiphertextToMaxLevel(a)
-			v.clampCiphertextToMaxLevel(b)
-
-			minL := a.Level()
-			if b.Level() < minL {
-				minL = b.Level()
-			}
-			if a.Level() > minL {
-				v.evaluator.DropLevel(a, a.Level()-minL)
-			}
-			if b.Level() > minL {
-				v.evaluator.DropLevel(b, b.Level()-minL)
-			}
-
-			tmp := ckks.NewCiphertext(v.params, 1, minL)
-			_ = v.evaluator.MulRelin(a, b, tmp)
-			v.clampCiphertextToMaxLevel(tmp)
-			*out = *tmp
-
-		case OP_MULCP:
-			dst := int(op.dst)
-			l := int(op.lhs)
-			p := int(op.rhs)
-			in0, pt, out := ctAt(l), ptAt(p), ctAt(dst)
-			if in0 == nil || pt == nil || out == nil {
-				continue
-			}
-			v.clampCiphertextToMaxLevel(in0)
-			_ = v.evaluator.Mul(in0, pt, out)
-			v.clampCiphertextToMaxLevel(out)
-
-		case OP_BOOT:
-			dst := int(op.dst)
-			src := int(op.lhs)
-			targetLevel := int(op.rhs)
-
-			in, out := ctAt(src), ctAt(dst)
-			if in == nil || out == nil {
-				continue
-			}
-			v.clampCiphertextToMaxLevel(in)
-			if err := v.ensureBoot(); err != nil {
-				fmt.Printf("[LATTIGO_HEVM][BOOT][ERR] %v\n", err)
-				continue
-			}
-
-			booted, err := v.bootEval.Bootstrap(in)
-			if err != nil {
-				fmt.Printf("[LATTIGO_HEVM][BOOT][ERR] Bootstrap: %v\n", err)
-				continue
-			}
-			v.clampCiphertextToMaxLevel(booted)
-			*out = *booted
-
-			if targetLevel >= 0 && targetLevel <= v.params.MaxLevel() {
-				if out.Level() > targetLevel {
-					v.evaluator.DropLevel(out, out.Level()-targetLevel)
-				}
-			}
-			v.clampCiphertextToMaxLevel(out)
-
-		default:
-			continue
-		}
-	}
-}
-
-// -------------------- Standalone Ops ABI --------------------
-
-//export BootEnable
-func BootEnable(h C.uintptr_t) C.int {
-	v := getVM(h)
-	if v == nil {
-		return 0
-	}
-	if v.params.LogN() == 0 || v.evaluator == nil {
-		_ = v.setupFromPresetNewKeys()
-	}
-	if err := v.ensureBoot(); err != nil {
-		fmt.Printf("[LATTIGO_HEVM][BOOT][ERR] %v\n", err)
-		return 0
-	}
-	return 1
-}
-
-//export EncryptTo
-func EncryptTo(h C.uintptr_t, dst C.int, data *C.double, n C.int, level C.int, log2Scale C.int) {
-	v := getVM(h)
-	if v == nil || data == nil || n <= 0 {
+	hevm, ok := hd.Value().(*LATTIGO_HEVM)
+	if !ok || hevm == nil {
 		return
 	}
-	if v.params.LogN() == 0 || v.encryptor == nil || v.encoder == nil {
-		_ = v.setupFromPresetNewKeys()
-	}
-	di := int(dst)
-	v.ensureBuffers(di+1, 1)
-
-	lv := int(level)
-	if lv < 0 || lv > v.params.MaxLevel() {
-		lv = v.params.MaxLevel()
-	}
-	ls := int(log2Scale)
-	if ls <= 0 {
-		ls = int(v.params.LogDefaultScale())
-	}
-
-	pt := ckks.NewPlaintext(v.params, lv)
-	pt.Scale = rlwe.NewScale(math.Exp2(float64(ls)))
-
-	ln := int(n)
-	src := (*[1 << 30]C.double)(unsafe.Pointer(data))[:ln:ln]
-	vec := make([]complex128, v.slots)
-	for s := 0; s < v.slots; s++ {
-		vec[s] = complex(float64(src[s%ln]), 0)
-	}
-	v.encoder.Encode(vec, pt)
-
-	ct := ckks.NewCiphertext(v.params, 1, lv)
-	v.encryptor.Encrypt(pt, ct)
-
-	v.clampCiphertextToMaxLevel(ct)
-	v.ciphers[di] = *ct
-}
-
-//export DecryptFrom
-func DecryptFrom(h C.uintptr_t, src C.int, out *C.double, n C.int) {
-	v := getVM(h)
-	if v == nil || out == nil || n <= 0 {
-		return
-	}
-	si := int(src)
-	if si < 0 || si >= len(v.ciphers) || v.decryptor == nil || v.encoder == nil {
-		return
-	}
-
-	v.clampCiphertextToMaxLevel(&v.ciphers[si])
-
-	ln := int(n)
-	pt := ckks.NewPlaintext(v.params, v.ciphers[si].Level())
-	v.decryptor.Decrypt(&v.ciphers[si], pt)
-
-	// ✅ important: decode using ct scale to avoid "scale explosion" effects
-	pt.Scale = v.ciphers[si].Scale
-
-	vec := make([]complex128, v.slots)
-	v.encoder.Decode(pt, vec)
-
-	dst := (*[1 << 30]C.double)(unsafe.Pointer(out))[:ln:ln]
-	lim := ln
-	if lim > len(vec) {
-		lim = len(vec)
-	}
-	for i := 0; i < lim; i++ {
-		dst[i] = C.double(real(vec[i]))
-	}
-}
-
-//export CTLevel
-func CTLevel(h C.uintptr_t, idx C.int) C.int {
-	v := getVM(h)
-	if v == nil {
-		return 0
-	}
-	i := int(idx)
-	if i < 0 || i >= len(v.ciphers) {
-		return 0
-	}
-	return C.int(v.ciphers[i].Level())
-}
-
-//export CTLog2Scale
-func CTLog2Scale(h C.uintptr_t, idx C.int) C.int {
-	v := getVM(h)
-	if v == nil {
-		return 0
-	}
-	i := int(idx)
-	if i < 0 || i >= len(v.ciphers) {
-		return 0
-	}
-	s := v.ciphers[i].Scale.Float64()
-	if s <= 0 {
-		return 0
-	}
-	return C.int(math.Round(math.Log2(s)))
-}
-
-//export OpAddCC
-func OpAddCC(h C.uintptr_t, dst C.int, a C.int, b C.int) {
-	v := getVM(h)
-	if v == nil || v.evaluator == nil {
-		return
-	}
-	di, ai, bi := int(dst), int(a), int(b)
-	v.ensureBuffers(di+1, 1)
-	if ai < 0 || ai >= len(v.ciphers) || bi < 0 || bi >= len(v.ciphers) {
-		return
-	}
-
-	aa := v.ciphers[ai].CopyNew()
-	bb := v.ciphers[bi].CopyNew()
-
-	v.clampCiphertextToMaxLevel(aa)
-	v.clampCiphertextToMaxLevel(bb)
-
-	minL := aa.Level()
-	if bb.Level() < minL {
-		minL = bb.Level()
-	}
-	if aa.Level() > minL {
-		v.evaluator.DropLevel(aa, aa.Level()-minL)
-	}
-	if bb.Level() > minL {
-		v.evaluator.DropLevel(bb, bb.Level()-minL)
-	}
-
-	// align scale
-	bb.Scale = aa.Scale
-
-	tmp := ckks.NewCiphertext(v.params, 1, minL)
-	tmp.Scale = aa.Scale
-	_ = v.evaluator.Add(aa, bb, tmp)
-
-	v.clampCiphertextToMaxLevel(tmp)
-	v.ciphers[di] = *tmp
-}
-
-//export OpMulCC
-func OpMulCC(h C.uintptr_t, dst C.int, a C.int, b C.int) {
-	v := getVM(h)
-	if v == nil || v.evaluator == nil {
-		return
-	}
-	di, ai, bi := int(dst), int(a), int(b)
-	v.ensureBuffers(di+1, 1)
-	if ai < 0 || ai >= len(v.ciphers) || bi < 0 || bi >= len(v.ciphers) {
-		return
-	}
-
-	aa := v.ciphers[ai].CopyNew()
-	bb := v.ciphers[bi].CopyNew()
-
-	v.clampCiphertextToMaxLevel(aa)
-	v.clampCiphertextToMaxLevel(bb)
-
-	minL := aa.Level()
-	if bb.Level() < minL {
-		minL = bb.Level()
-	}
-	if aa.Level() > minL {
-		v.evaluator.DropLevel(aa, aa.Level()-minL)
-	}
-	if bb.Level() > minL {
-		v.evaluator.DropLevel(bb, bb.Level()-minL)
-	}
-
-	tmp := ckks.NewCiphertext(v.params, 1, minL)
-	_ = v.evaluator.MulRelin(aa, bb, tmp)
-
-	v.clampCiphertextToMaxLevel(tmp)
-	v.ciphers[di] = *tmp
-}
-
-//export OpRescale
-func OpRescale(h C.uintptr_t, dst C.int, src C.int) {
-	v := getVM(h)
-	if v == nil || v.evaluator == nil {
-		return
-	}
-	di, si := int(dst), int(src)
-	v.ensureBuffers(di+1, 1)
-	if si < 0 || si >= len(v.ciphers) {
-		return
-	}
-
-	v.clampCiphertextToMaxLevel(&v.ciphers[si])
-	_ = v.evaluator.Rescale(&v.ciphers[si], &v.ciphers[di])
-	v.clampCiphertextToMaxLevel(&v.ciphers[di])
-}
-
-//export OpRotate
-func OpRotate(h C.uintptr_t, dst C.int, src C.int, k C.int) {
-	v := getVM(h)
-	if v == nil || v.evaluator == nil {
-		return
-	}
-	di, si := int(dst), int(src)
-	kk := int(int16(k))
-	v.ensureBuffers(di+1, 1)
-	if si < 0 || si >= len(v.ciphers) {
-		return
-	}
-
-	v.clampCiphertextToMaxLevel(&v.ciphers[si])
-	v.ensureRotationKey(kk)
-	_ = v.evaluator.Rotate(&v.ciphers[si], kk, &v.ciphers[di])
-	v.clampCiphertextToMaxLevel(&v.ciphers[di])
-}
-
-//export BootstrapTo
-func BootstrapTo(h C.uintptr_t, dst C.int, src C.int) C.int {
-	v := getVM(h)
-	if v == nil {
-		return 0
-	}
-	if v.params.LogN() == 0 || v.evaluator == nil {
-		_ = v.setupFromPresetNewKeys()
-	}
-	di, si := int(dst), int(src)
-	v.ensureBuffers(di+1, 1)
-	if si < 0 || si >= len(v.ciphers) {
-		return 0
-	}
-
-	v.clampCiphertextToMaxLevel(&v.ciphers[si])
-
-	if err := v.ensureBoot(); err != nil {
-		fmt.Printf("[LATTIGO_HEVM][BOOT][ERR] %v\n", err)
-		return 0
-	}
-	booted, err := v.bootEval.Bootstrap(&v.ciphers[si])
-	if err != nil {
-		fmt.Printf("[LATTIGO_HEVM][BOOT][ERR] Bootstrap: %v\n", err)
-		return 0
-	}
-
-	v.clampCiphertextToMaxLevel(booted)
-	v.ciphers[di] = *booted
-	return 1
-}
-
-//export Slots
-func Slots(h C.uintptr_t) C.int {
-	v := getVM(h)
-	if v == nil {
-		return 0
-	}
-	return C.int(v.slots)
-}
-
-//export LogN
-func LogN(h C.uintptr_t) C.int {
-	v := getVM(h)
-	if v == nil {
-		return 0
-	}
-	return C.int(v.params.LogN())
-}
-
-//export MaxLevel
-func MaxLevel(h C.uintptr_t) C.int {
-	v := getVM(h)
-	if v == nil {
-		return 0
-	}
-	return C.int(v.params.MaxLevel())
-}
-
-//export LogDefaultScale
-func LogDefaultScale(h C.uintptr_t) C.int {
-	v := getVM(h)
-	if v == nil {
-		return 0
-	}
-	return C.int(v.params.LogDefaultScale())
-}
-
-//export getArgLen
-func getArgLen(h C.uintptr_t) C.int64_t {
-	v := getVM(h)
-	if v == nil {
-		return 0
-	}
-	return C.int64_t(v.header.config_header.arg_length)
-}
-
-//export getResLen
-func getResLen(h C.uintptr_t) C.int64_t {
-	v := getVM(h)
-	if v == nil {
-		return 0
-	}
-	return C.int64_t(v.header.config_header.res_length)
+	hevm.decrypt(int64(i), dat)
 }
 
 //export decrypt_result
-func decrypt_result(h C.uintptr_t, resIdx C.int64_t, out *C.double, n C.int) {
-	v := getVM(h)
-	if v == nil || out == nil || n <= 0 {
+func decrypt_result(vm unsafe.Pointer, i C.int64_t, dat *C.double) {
+	hd, ok := loadHandlePtr(vm)
+	if !ok {
 		return
 	}
-	r := int(resIdx)
-	if r < 0 || r >= len(v.resDst) {
+	hevm, ok := hd.Value().(*LATTIGO_HEVM)
+	if !ok || hevm == nil {
 		return
 	}
-	ctID := int(v.resDst[r])
-	DecryptFrom(h, C.int(ctID), out, n)
+	ii := int64(i)
+	if ii < 0 || ii >= int64(len(hevm.res_dst)) {
+		return
+	}
+	hevm.decrypt(int64(hevm.res_dst[ii]), dat)
 }
 
 //export getResIdx
-func getResIdx(h C.uintptr_t, i C.int64_t) C.int64_t {
-	v := getVM(h)
-	if v == nil {
+func getResIdx(vm unsafe.Pointer, i C.int64_t) C.int64_t {
+	hd, ok := loadHandlePtr(vm)
+	if !ok {
 		return i
 	}
-	ii := int(i)
-	if ii < 0 || ii >= len(v.resDst) {
+	hevm, ok := hd.Value().(*LATTIGO_HEVM)
+	if !ok || hevm == nil {
 		return i
 	}
-	return C.int64_t(v.resDst[ii])
+	ii := int64(i)
+	if ii < 0 || ii >= int64(len(hevm.res_dst)) {
+		return i
+	}
+	return C.int64_t(hevm.res_dst[ii])
 }
 
 //export getCtxt
-func getCtxt(h C.uintptr_t, i C.int64_t) C.uintptr_t {
-	v := getVM(h)
-	if v == nil {
-		return 0
+func getCtxt(vm unsafe.Pointer, id C.int64_t) unsafe.Pointer {
+	hd, ok := loadHandlePtr(vm)
+	if !ok {
+		return nil
 	}
-	ii := int(i)
-	if ii < 0 || ii >= len(v.ciphers) {
-		return 0
+	hevm, ok := hd.Value().(*LATTIGO_HEVM)
+	if !ok || hevm == nil {
+		return nil
 	}
-	return exportCiphertextHandle(&v.ciphers[ii])
+	ii := int(id)
+	if ii < 0 || ii >= len(hevm.ciphers) {
+		return nil
+	}
+	return exportCiphertextHandle(&hevm.ciphers[ii])
 }
 
 //export setCtxt
-func setCtxt(h C.uintptr_t, i C.int64_t, ctH C.uintptr_t) {
-	v := getVM(h)
-	if v == nil {
+func setCtxt(vm unsafe.Pointer, id C.int64_t, ct unsafe.Pointer) {
+	hd, ok := loadHandlePtr(vm)
+	if !ok {
 		return
 	}
-	ii := int(i)
-	if ii < 0 || ii >= len(v.ciphers) {
+	hevm, ok := hd.Value().(*LATTIGO_HEVM)
+	if !ok || hevm == nil {
 		return
 	}
-	ct := importCiphertextHandle(ctH)
-	if ct == nil {
+	ii := int(id)
+	if ii < 0 || ii >= len(hevm.ciphers) {
 		return
 	}
-	v.ciphers[ii] = *ct
+	c := importCiphertextHandle(ct)
+	if c == nil {
+		return
+	}
+	hevm.ciphers[ii] = *c
+	hevm.scalec[ii] = log2ScaleOf(&hevm.ciphers[ii], hevm.params.LogDefaultScale())
 }
 
 //export freeCtxt
-func freeCtxt(ctH C.uintptr_t) {
-	if ctH == 0 {
+func freeCtxt(ct unsafe.Pointer) {
+	freeHandlePtr(ct)
+}
+
+//export preprocess
+func preprocess(vm unsafe.Pointer) {
+	hd, ok := loadHandlePtr(vm)
+	if !ok {
 		return
 	}
-	cgo.Handle(ctH).Delete()
+	hevm, ok := hd.Value().(*LATTIGO_HEVM)
+	if !ok || hevm == nil {
+		return
+	}
+	hevm.preprocess()
+}
+
+//export run
+func run(vm unsafe.Pointer) {
+	hd, ok := loadHandlePtr(vm)
+	if !ok {
+		return
+	}
+	hevm, ok := hd.Value().(*LATTIGO_HEVM)
+	if !ok || hevm == nil {
+		return
+	}
+	hevm.run()
+}
+
+//export getArgLen
+func getArgLen(vm unsafe.Pointer) C.int64_t {
+	hd, ok := loadHandlePtr(vm)
+	if !ok {
+		return 0
+	}
+	hevm, ok := hd.Value().(*LATTIGO_HEVM)
+	if !ok || hevm == nil {
+		return 0
+	}
+	return C.int64_t(hevm.header.config_header.arg_length)
+}
+
+//export getResLen
+func getResLen(vm unsafe.Pointer) C.int64_t {
+	hd, ok := loadHandlePtr(vm)
+	if !ok {
+		return 0
+	}
+	hevm, ok := hd.Value().(*LATTIGO_HEVM)
+	if !ok || hevm == nil {
+		return 0
+	}
+	return C.int64_t(hevm.header.config_header.res_length)
 }
 
 //export setDebug
-func setDebug(h C.uintptr_t, enable C._Bool) {
-	v := getVM(h)
-	if v != nil {
-		v.debug = bool(enable)
+func setDebug(vm unsafe.Pointer, enable C._Bool) {
+	hd, ok := loadHandlePtr(vm)
+	if !ok {
+		return
 	}
+	hevm, ok := hd.Value().(*LATTIGO_HEVM)
+	if !ok || hevm == nil {
+		return
+	}
+	hevm.debug = bool(enable)
 }
 
 //export setToGPU
-func setToGPU(h C.uintptr_t, ongpu C._Bool) {
-	v := getVM(h)
-	if v != nil {
-		v.toGPU = bool(ongpu)
+func setToGPU(vm unsafe.Pointer, ongpu C._Bool) {
+	hd, ok := loadHandlePtr(vm)
+	if !ok {
+		return
 	}
+	hevm, ok := hd.Value().(*LATTIGO_HEVM)
+	if !ok || hevm == nil {
+		return
+	}
+	hevm.togpu = bool(ongpu)
 }
 
 //export printMem
-func printMem(h C.uintptr_t) {
-	v := getVM(h)
-	if v == nil {
+func printMem(vm unsafe.Pointer) {
+	hd, ok := loadHandlePtr(vm)
+	if !ok {
 		return
 	}
-	fmt.Printf("[LATTIGO_HEVM] printMem handle=%d preset=%s logN=%d slots=%d maxLevel=%d\n",
-		uintptr(h), v.paramName, v.params.LogN(), v.slots, v.params.MaxLevel())
+	hevm, ok := hd.Value().(*LATTIGO_HEVM)
+	if !ok || hevm == nil {
+		return
+	}
+
+	fmt.Printf("[LATTIGO_HEVM] printMem preset=%s logN=%d slots=%d maxLevel=%d boot_cnt=%d boot_time_us=%d\n",
+		hevm.paramName, hevm.params.LogN(), hevm.slots, hevm.params.MaxLevel(), hevm.boot_cnt, hevm.boot_time)
+}
+
+func log2ScaleOf(ct *rlwe.Ciphertext, fallback float64) float64 {
+	if ct == nil {
+		return fallback
+	}
+	s := ct.Scale.Float64()
+	if s <= 0 {
+		return fallback
+	}
+	return math.Round(math.Log2(s))
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func main() {}
