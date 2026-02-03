@@ -21,7 +21,7 @@ extern const char *_GoStringPtr(_GoString_ s);
 /* Start of preamble from import "C" comments.  */
 
 
-#line 28 "hevm_stub.go"
+#line 26 "hevm_stub.go"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -94,7 +94,11 @@ extern uintptr_t initFullVM(char* dir, _Bool device);
 extern uintptr_t initClientVM(char* dir);
 extern uintptr_t initServerVM(char* dir);
 extern void freeVM(uintptr_t h);
+extern void setDebug(uintptr_t h, _Bool enable);
+extern void setToGPU(uintptr_t h, _Bool ongpu);
+extern void printMem(uintptr_t h);
 extern void load(uintptr_t h, char* constPath, char* hevmPath);
+extern void loadClient(uintptr_t h, char* constPath);
 extern void preprocess(uintptr_t h);
 extern void run(uintptr_t h);
 extern int64_t getArgLen(uintptr_t h);
@@ -104,7 +108,7 @@ extern void encrypt(uintptr_t h, int64_t i, double* dat, int length);
 extern void decrypt(uintptr_t h, int64_t i, double* dat);
 extern void decrypt_result(uintptr_t h, int64_t i, double* dat);
 extern int64_t getResIdx(uintptr_t h, int64_t i);
-extern void printMem(uintptr_t h);
+extern void* getCtxt(uintptr_t h, int64_t id);
 
 #ifdef __cplusplus
 }

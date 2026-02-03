@@ -1,8 +1,6 @@
 // hevm_stub.go (Lattigo v6.1.1) - SEAL-like CKKS backend (N=2^15, L=14 -> maxLevel=13)
 // Fix: HEVM ConfigBody is READ AS 5x u64 (40 bytes), matching your working hevm_reader.go.
 //
-//	If you read 80 bytes here, you'll shift the stream by +40B and hit EOF near the end of ops.
-//
 // Build:
 //
 //	go build -v -buildmode=c-shared -o libLATTIGO_HEVM.so hevm_stub.go
@@ -699,7 +697,6 @@ func (v *VM) rotateDecomp(dst, src int, k int) {
 			step := sign * (1 << bit)
 			gk := v.galPow2[step]
 			if gk == nil {
-				// no key -> pass-through
 				*tmp = *cur
 			} else {
 				_ = v.evaluator.Rotate(cur, step, tmp)
@@ -783,7 +780,7 @@ func create_context(dir *C.char) {
 //export initFullVM
 func initFullVM(dir *C.char, device C._Bool) C.uintptr_t {
 	d := C.GoString(dir)
-	vm := &VM{role: ROLE_FULL, togpu: bool(device)}
+	vm := &VM{role: ROLE_FULL, togpu: bool(device), debug: true}
 	if err := vm.loadFull(d); err != nil {
 		fmt.Printf("[LATTIGO_HEVM][ERR] initFullVM loadFull: %v\n", err)
 	}
@@ -794,7 +791,7 @@ func initFullVM(dir *C.char, device C._Bool) C.uintptr_t {
 //export initClientVM
 func initClientVM(dir *C.char) C.uintptr_t {
 	d := C.GoString(dir)
-	vm := &VM{role: ROLE_CLIENT}
+	vm := &VM{role: ROLE_CLIENT, debug: true}
 	if err := vm.loadClientOnly(d); err != nil {
 		fmt.Printf("[LATTIGO_HEVM][ERR] initClientVM loadClient: %v\n", err)
 	}
@@ -805,7 +802,7 @@ func initClientVM(dir *C.char) C.uintptr_t {
 //export initServerVM
 func initServerVM(dir *C.char) C.uintptr_t {
 	d := C.GoString(dir)
-	vm := &VM{role: ROLE_SERVER}
+	vm := &VM{role: ROLE_SERVER, debug: true}
 	if err := vm.loadServerOnly(d); err != nil {
 		fmt.Printf("[LATTIGO_HEVM][ERR] initServerVM loadServer: %v\n", err)
 	}
@@ -818,6 +815,35 @@ func freeVM(h C.uintptr_t) {
 	if h != 0 {
 		cgo.Handle(h).Delete()
 	}
+}
+
+//export setDebug
+func setDebug(h C.uintptr_t, enable C._Bool) {
+	v := getVM(h)
+	if v == nil {
+		return
+	}
+	v.debug = bool(enable)
+}
+
+//export setToGPU
+func setToGPU(h C.uintptr_t, ongpu C._Bool) {
+	v := getVM(h)
+	if v == nil {
+		return
+	}
+	// Lattigo 后端这里不一定真有 GPU；但 runner.py 需要符号存在
+	v.togpu = bool(ongpu)
+}
+
+//export printMem
+func printMem(h C.uintptr_t) {
+	v := getVM(h)
+	if v == nil {
+		return
+	}
+	fmt.Printf("[LATTIGO_HEVM] preset=%s logN=%d slots=%d maxLevel=%d loaded=%v debug=%v togpu=%v\n",
+		v.paramName, v.params.LogN(), v.slots, v.params.MaxLevel(), v.loadedOK, v.debug, v.togpu)
 }
 
 //export load
@@ -843,6 +869,30 @@ func load(h C.uintptr_t, constPath *C.char, hevmPath *C.char) {
 		return
 	}
 
+	v.loadedOK = true
+}
+
+//export loadClient
+func loadClient(h C.uintptr_t, constPath *C.char) {
+	// hecate/runner.py 里 client 模式会调用 loadClient(self.vm, const_path)
+	// 这里按“最小可用”实现：加载常量；program header/ops 不在 client-only 阶段加载
+	// （如你后续做 client/server 真通信，需要把 stream 版再补出来）
+	v := getVM(h)
+	if v == nil {
+		return
+	}
+	v.loadedOK = false
+
+	cpath := C.GoString(constPath)
+	consts, err := readConstantsBin(cpath)
+	if err != nil {
+		fmt.Printf("[LATTIGO_HEVM][ERR] loadClient read constants: %v\n", err)
+		return
+	}
+	v.consts = consts
+
+	// 保证 preprocess 不会因为 slots/encoder 为 nil 挂：client VM 初始化时已 loadParm 并建 encoder
+	// 这里不设 hdr/cfg/ops，client-only 下 runner 通常也不会 run(program)
 	v.loadedOK = true
 }
 
@@ -897,19 +947,41 @@ func run(h C.uintptr_t) {
 		return &v.plains[i]
 	}
 
-	for _, op := range v.ops {
+	// 打印密文元信息（level/scale），可选再解密打印 head（很慢）
+	printCtMeta := func(tag string, id int, ct *rlwe.Ciphertext) {
+		if !v.debug || ct == nil {
+			return
+		}
+		log2s := 0.0
+		if s := ct.Scale.Float64(); s > 0 {
+			log2s = math.Log2(s)
+		}
+		fmt.Printf("%s ct[%d]: level=%d log2(scale)=%.3f\n", tag, id, ct.Level(), log2s)
+	}
+
+	for idx, op := range v.ops {
+		if v.debug {
+			fmt.Printf("[OP] #%d opcode=%d dst=%d lhs=%d rhs_u16=%d rhs_i16=%d\n",
+				idx, op.Opcode, op.Dst, op.Lhs, op.Rhs, int16(op.Rhs))
+		}
+
 		switch int(op.Opcode) {
 		case OP_ENCODE:
+			// preprocess 已经把 encode 生成到 v.plains 里
 			continue
 
 		case OP_ROTATEC:
 			dst := int(op.Dst)
 			src := int(op.Lhs)
-			k := int(int16(op.Rhs))
-			if ctAt(dst) == nil || ctAt(src) == nil {
+			k := int(int16(op.Rhs)) // rotate 是有符号
+			in, out := ctAt(src), ctAt(dst)
+			if in == nil || out == nil || v.evaluator == nil {
 				continue
 			}
-			v.rotateDecomp(dst, src, k)
+			if err := v.evaluator.Rotate(in, k, out); err != nil && v.debug {
+				fmt.Printf("[LATTIGO_HEVM][ERR] Rotate: %v\n", err)
+			}
+			printCtMeta("[DST]", dst, out)
 
 		case OP_NEGATEC:
 			dst := int(op.Dst)
@@ -918,7 +990,11 @@ func run(h C.uintptr_t) {
 			if in == nil || out == nil || v.evaluator == nil {
 				continue
 			}
-			_ = v.evaluator.Mul(in, -1.0, out)
+			// negate = mul by -1
+			if err := v.evaluator.Mul(in, -1.0, out); err != nil && v.debug {
+				fmt.Printf("[LATTIGO_HEVM][ERR] Neg(Mul -1): %v\n", err)
+			}
+			printCtMeta("[DST]", dst, out)
 
 		case OP_RESCALEC:
 			dst := int(op.Dst)
@@ -927,21 +1003,52 @@ func run(h C.uintptr_t) {
 			if in == nil || out == nil || v.evaluator == nil {
 				continue
 			}
-			_ = v.evaluator.Rescale(in, out)
+			if err := v.evaluator.Rescale(in, out); err != nil && v.debug {
+				fmt.Printf("[LATTIGO_HEVM][ERR] Rescale: %v\n", err)
+			}
+			printCtMeta("[DST]", dst, out)
 
 		case OP_MODSWC:
+			// 关键修复点：
+			// - rhs 在 HEVM 里很可能是 int16 语义（允许 -1 作为 no-op/auto），必须用 int16 解释
+			// - DropLevel 的 down 不能超过 in.Level()，否则会导致内部 Resize 负长度而 panic
 			dst := int(op.Dst)
 			src := int(op.Lhs)
-			down := int(op.Rhs)
+
+			down := int(int16(op.Rhs)) // 0xFFFF => -1
 			in, out := ctAt(src), ctAt(dst)
 			if in == nil || out == nil || v.evaluator == nil {
 				continue
 			}
-			*out = *in
-			safeDropLevel(v.evaluator, out, down)
+
+			// 复制输入
+			*out = *in.CopyNew()
+
+			if v.debug {
+				fmt.Printf("[MODSWC] src=%d dst=%d rhs_u16=%d rhs_i16=%d inLevel=%d\n",
+					src, dst, op.Rhs, int16(op.Rhs), in.Level())
+			}
+
+			// -1/0 视为 no-op
+			if down <= 0 {
+				printCtMeta("[DST]", dst, out)
+				continue
+			}
+
+			// clamp：down 不能超过当前 level
+			if down > out.Level() {
+				if v.debug {
+					fmt.Printf("[MODSWC][WARN] clamp down %d -> %d (out.Level)\n", down, out.Level())
+				}
+				down = out.Level()
+			}
+
+			// DropLevel 是“丢掉 down 个 level”（相对下降）
+			v.evaluator.DropLevel(out, down)
+			printCtMeta("[DST]", dst, out)
 
 		case OP_UPSCALEC:
-			// not implemented here (SEAL-like)
+			// 你的 SEAL-like pipeline 里暂不实现
 			continue
 
 		case OP_ADDCC:
@@ -952,21 +1059,10 @@ func run(h C.uintptr_t) {
 			if in0 == nil || in1 == nil || out == nil || v.evaluator == nil {
 				continue
 			}
-			a := in0.CopyNew()
-			b := in1.CopyNew()
-
-			minL := a.Level()
-			if b.Level() < minL {
-				minL = b.Level()
+			if err := v.evaluator.Add(in0, in1, out); err != nil && v.debug {
+				fmt.Printf("[LATTIGO_HEVM][ERR] Add(ct,ct): %v\n", err)
 			}
-			safeDropLevel(v.evaluator, a, a.Level()-minL)
-			safeDropLevel(v.evaluator, b, b.Level()-minL)
-			b.Scale = a.Scale
-
-			tmp := ckks.NewCiphertext(v.params, 1, minL)
-			tmp.Scale = a.Scale
-			_ = v.evaluator.Add(a, b, tmp)
-			*out = *tmp
+			printCtMeta("[DST]", dst, out)
 
 		case OP_ADDCP:
 			dst := int(op.Dst)
@@ -976,14 +1072,10 @@ func run(h C.uintptr_t) {
 			if in0 == nil || pt == nil || out == nil || v.evaluator == nil {
 				continue
 			}
-			a := in0.CopyNew()
-			if a.Level() > pt.Level() {
-				safeDropLevel(v.evaluator, a, a.Level()-pt.Level())
+			if err := v.evaluator.Add(in0, pt, out); err != nil && v.debug {
+				fmt.Printf("[LATTIGO_HEVM][ERR] Add(ct,pt): %v\n", err)
 			}
-			tmp := ckks.NewCiphertext(v.params, 1, a.Level())
-			tmp.Scale = a.Scale
-			_ = v.evaluator.Add(a, pt, tmp)
-			*out = *tmp
+			printCtMeta("[DST]", dst, out)
 
 		case OP_MULCC:
 			dst := int(op.Dst)
@@ -993,19 +1085,10 @@ func run(h C.uintptr_t) {
 			if in0 == nil || in1 == nil || out == nil || v.evaluator == nil {
 				continue
 			}
-			a := in0.CopyNew()
-			b := in1.CopyNew()
-
-			minL := a.Level()
-			if b.Level() < minL {
-				minL = b.Level()
+			if err := v.evaluator.MulRelin(in0, in1, out); err != nil && v.debug {
+				fmt.Printf("[LATTIGO_HEVM][ERR] MulRelin(ct,ct): %v\n", err)
 			}
-			safeDropLevel(v.evaluator, a, a.Level()-minL)
-			safeDropLevel(v.evaluator, b, b.Level()-minL)
-
-			tmp := ckks.NewCiphertext(v.params, 1, minL)
-			_ = v.evaluator.MulRelin(a, b, tmp)
-			*out = *tmp
+			printCtMeta("[DST]", dst, out)
 
 		case OP_MULCP:
 			dst := int(op.Dst)
@@ -1015,19 +1098,22 @@ func run(h C.uintptr_t) {
 			if in0 == nil || pt == nil || out == nil || v.evaluator == nil {
 				continue
 			}
-			_ = v.evaluator.Mul(in0, pt, out)
+			if err := v.evaluator.Mul(in0, pt, out); err != nil && v.debug {
+				fmt.Printf("[LATTIGO_HEVM][ERR] Mul(ct,pt): %v\n", err)
+			}
+			printCtMeta("[DST]", dst, out)
 
 		case OP_BOOT:
 			dst := int(op.Dst)
 			src := int(op.Lhs)
-			targetLevel := int(op.Rhs)
+			targetLevel := int(op.Rhs) // 这里按你现有定义（u16）
 			if ctAt(dst) == nil || ctAt(src) == nil {
 				continue
 			}
 			v.pseudoBootstrap(dst, src, targetLevel)
+			printCtMeta("[DST]", dst, ctAt(dst))
 
 		default:
-			// includes opcode==0xFFFF (NOP/Pad): do nothing
 			continue
 		}
 	}
@@ -1144,14 +1230,18 @@ func getResIdx(h C.uintptr_t, i C.int64_t) C.int64_t {
 	return C.int64_t(v.resDst[ii])
 }
 
-//export printMem
-func printMem(h C.uintptr_t) {
+//export getCtxt
+func getCtxt(h C.uintptr_t, id C.int64_t) unsafe.Pointer {
 	v := getVM(h)
 	if v == nil {
-		return
+		return nil
 	}
-	fmt.Printf("[LATTIGO_HEVM] preset=%s logN=%d slots=%d maxLevel=%d loaded=%v\n",
-		v.paramName, v.params.LogN(), v.slots, v.params.MaxLevel(), v.loadedOK)
+	i := int(id)
+	if i < 0 || i >= len(v.ciphers) {
+		return nil
+	}
+	// 返回 ciphertext buffer 内部对象地址（用于通信/调试；即使当前不用，也要满足 ABI）
+	return unsafe.Pointer(&v.ciphers[i])
 }
 
 func main() {}
